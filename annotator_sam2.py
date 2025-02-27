@@ -73,6 +73,9 @@ class MainWindow(QMainWindow):
         self.canvas.zoomRequest.connect(self.zoomRequest)
 
         self.memory_shapes = []
+        self.image = []
+        self.image_np = []
+        self.masks = []
         self.sam_mask = []
         self.sam_mask_proposal = []
         self.image_encoded_flag = False
@@ -484,6 +487,171 @@ class MainWindow(QMainWindow):
         self.zoomWidget.valueChanged.connect(self.paintCanvas)
         self.canvas.actions = self.actions
     
+    def exportCSVResults(self):
+        """
+        現在の画像について、self.sam_mask（もしくは他の適切なマスクリスト）から
+        解析結果を計算し、csv_exporter を利用して CSV 出力する。
+        CSV のファイル名は、実験パラメータ（date, experimenter, impurity_type, impurity_concentration,
+        seed_size, crystallization_time, suspension_density, image_scaler）から構築する。
+        """
+        if not self.current_img:
+            QMessageBox.warning(self, self.tr("Warning"), self.tr("No image loaded"))
+            return None, None, None
+        
+        # 例として、self.sam_mask に含まれる各マスク（Shape オブジェクト）から
+        # cv2.findContours, cv2.minAreaRect を用いて OBB 情報を計算する
+        results = []
+        visualized_image = self.image_np.copy()
+        # ここでは、各 mask について簡易に解析する例（実際にはマスクの取得方法に合わせて調整してください）
+        # 各マスクに対してBBとOBBを計算
+        print(self.masks)
+        for idx, mask in enumerate(self.masks):
+            # マスクを2次元のuint8形式に変換
+            binary_mask = mask.squeeze().astype(np.uint8)
+
+            # マスクが空でないか確認
+            if np.any(binary_mask):
+                contours, _ = cv2.findContours(
+                    binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+
+                for contour in contours:
+                    # 面積でフィルタリング
+                    area = cv2.contourArea(contour)
+                    if area < 10:  # 面積が小さい場合はスキップ
+                        print(f"Mask {idx}: Skipped due to small area ({area}).")
+                        continue
+
+                    # Oriented Bounding Box (OBB)
+                    rect = cv2.minAreaRect(contour)
+                    (cx, cy), (width, height), angle = rect
+
+                    if width == 0 or height == 0:  # 幅または高さが0の場合スキップ
+                        print(
+                            f"Mask {idx}: Skipped due to invalid OBB dimensions (width={width}, height={height})."
+                        )
+                        continue
+
+                    # OBBの四角形を取得
+                    box = cv2.boxPoints(rect)
+                    box = np.intp(box)
+                    cv2.drawContours(
+                        visualized_image, [box], 0, (0, 255, 255), 2
+                    )  # 黄色でOBBを描画
+
+                    # OBBの中心から両矢印で幅と高さを描画
+                    center = (int(cx), int(cy))
+                    angle_rad = np.radians(angle)
+
+                    width_vector = (
+                        (width / 2) * np.cos(angle_rad),
+                        (width / 2) * np.sin(angle_rad),
+                    )
+                    height_vector = (
+                        (height / 2) * np.sin(angle_rad),
+                        -(height / 2) * np.cos(angle_rad),
+                    )
+
+                    width_arrow_start = (
+                        int(cx - width_vector[0]),
+                        int(cy - width_vector[1]),
+                    )
+                    width_arrow_end = (
+                        int(cx + width_vector[0]),
+                        int(cy + width_vector[1]),
+                    )
+
+                    height_arrow_start = (
+                        int(cx - height_vector[0]),
+                        int(cy - height_vector[1]),
+                    )
+                    height_arrow_end = (
+                        int(cx + height_vector[0]),
+                        int(cy + height_vector[1]),
+                    )
+
+                    # 両矢印を描画 (幅: 緑, 高さ: ピンク)
+                    cv2.arrowedLine(
+                        visualized_image,
+                        width_arrow_start,
+                        width_arrow_end,
+                        (0, 255, 0),
+                        2,
+                        tipLength=0.1,
+                    )
+                    cv2.arrowedLine(
+                        visualized_image,
+                        width_arrow_end,
+                        width_arrow_start,
+                        (0, 255, 0),
+                        2,
+                        tipLength=0.1,
+                    )
+                    cv2.arrowedLine(
+                        visualized_image,
+                        height_arrow_start,
+                        height_arrow_end,
+                        (255, 105, 180),
+                        2,
+                        tipLength=0.1,
+                    )
+                    cv2.arrowedLine(
+                        visualized_image,
+                        height_arrow_end,
+                        height_arrow_start,
+                        (255, 105, 180),
+                        2,
+                        tipLength=0.1,
+                    )
+
+                    # ラベル（ID）を描画
+                    label_position = (int(cx), int(cy) - 10)
+                    cv2.putText(
+                        visualized_image,
+                        f"ID:{idx}",
+                        label_position,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 0, 255),
+                        2,
+                    )
+
+                    # 結果を保存
+                    results.append(
+                        {
+                            "mask_index": idx,
+                            "area": area,
+                            "obb_width": width,
+                            "obb_height": height,
+                            "obb_angle": angle,
+                        }
+                    )
+            else:
+                print(f"Mask {idx} is empty and skipped.")
+        
+        # 可視化画像を保存
+        visualized_image_path = (f"output/{self.current_img}_visualized.jpg")
+        cv2.imwrite(
+            visualized_image_path, cv2.cvtColor(visualized_image, cv2.COLOR_RGB2BGR)
+        )
+
+        if not results:
+            QMessageBox.information(self, self.tr("Info"), self.tr("No valid masks for analysis."))
+            return None, None, None
+        
+        # 実験パラメータの取得（showExperimentParamsDialog で更新された隠し QLineEdit から）
+        experiment_params = {
+            "date": self.date_edit.text(),
+            "experimenter": self.experimenter_edit.text(),
+            "impurity_type": self.impurity_type_edit.text(),
+            "impurity_concentration": self.impurity_conc_edit.text(),
+            "seed_size": self.seed_size_edit.text(),
+            "crystallization_time": self.crystal_time_edit.text(),
+            "suspension_density": self.suspension_density_edit.text(),
+            "image_scaler": self.image_scaler_edit.text(),
+        }
+        return results, experiment_params, self.current_output_dir
+    
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
         self._saveFile(self.saveFileDialog())
@@ -500,6 +668,13 @@ class MainWindow(QMainWindow):
         #     self._saveFile(self.saveFileDialog())
         #self._saveFile(self.saveFileDialog())
         #print(self.current_output_filename)
+        results, experiment_params, output_dir = self.exportCSVResults()
+        if results is not None and experiment_params is not None and output_dir is not None:
+            csv_exporter.export_csv(results, experiment_params, output_dir)
+            self._saveFile(self.current_output_filename)
+        else:
+            # エラーメッセージは既に exportCSVResults 内で表示されているので、ここでは何もしない
+            pass
         self._saveFile(self.current_output_filename)
 
     def _saveFile(self, filename):
@@ -661,9 +836,11 @@ class MainWindow(QMainWindow):
         if len(self.sam_mask_proposal) > 3:
             self.sam_mask = self.sam_mask_proposal[3]
             self.canvas.setHiding()
-            self.canvas.update()
+            self.canvas.update()    
             
     def loadImg(self):
+        self.image = Image.open(self.current_img)
+        self.image_np = np.array(self.image.convert("RGB"))
         self.raw_h, self.raw_w = cv2.imread(self.current_img).shape[:2]
         pixmap = QPixmap(self.current_img)
         #pixmap = pixmap.scaled(int(0.75 * global_w), int(0.7 * global_h))
@@ -858,6 +1035,7 @@ class MainWindow(QMainWindow):
             box=input_box[None, :],
             multimask_output=True,
         )
+        self.masks = masks
         masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
 
         target_idx = np.argmax(iou_prediction)
@@ -927,6 +1105,7 @@ class MainWindow(QMainWindow):
             point_labels=input_types,
             multimask_output=True,
         )
+        self.masks = masks
         masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
         
         target_idx = np.argmax(iou_prediction)
