@@ -3,6 +3,17 @@ We developed a python UI based on labelme and segment-anything for pixel-level a
 
 Any feedback or suggestions are welcomed. We will continuously add features and fix bugs. 👀👀👀
 
+## 出力形式
+出力形式
+CSVファイル
+各マスクについて以下の情報が記録されます：
+| フィールド名 | 説明 | 単位 |
+|------------|------|------|
+| mask_index | マスクの識別番号 | - |
+| area | マスクの面積 | ピクセル² |
+| obb_width | 向き付き境界ボックスの幅 | ピクセル |
+| obb_height | 向き付き境界ボックスの高さ | ピクセル |
+| obb_angle | 向き付き境界ボックスの角度 | 度（-90°〜90°） |
 
 ## News
 `28 Apr`: Change the output format with labelme format. If you want to use the old output format, please use `backup/annotator.py`.

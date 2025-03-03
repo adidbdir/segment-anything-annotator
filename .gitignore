@@ -1,3 +1,11 @@
 external/*
 output/*
 docker/*
+
+*.jpg
+*.png
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
