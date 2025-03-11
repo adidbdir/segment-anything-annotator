@@ -13,6 +13,7 @@ import numpy as np
 import tempfile
 import torch
 import base64
+import csv
 
 from PyQt5.QtWidgets import QWidget, QApplication, QMainWindow, QApplication, QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, QScrollArea, QDockWidget, QMessageBox, QLineEdit
 from PyQt5.QtGui import QPixmap, QIcon, QImage
@@ -432,7 +433,7 @@ class MainWindow(QMainWindow):
                 undo,
                 save,
             )
-            )
+        )
 
         # Custom context menu for the canvas widget:
         utils.addActions(self.canvas.menus[0], self.actions.menu)
@@ -504,7 +505,6 @@ class MainWindow(QMainWindow):
         visualized_image = self.image_np.copy()
         # ここでは、各 mask について簡易に解析する例（実際にはマスクの取得方法に合わせて調整してください）
         # 各マスクに対してBBとOBBを計算
-        print(self.masks)
         for idx, mask in enumerate(self.masks):
             # マスクを2次元のuint8形式に変換
             binary_mask = mask.squeeze().astype(np.uint8)
@@ -619,11 +619,14 @@ class MainWindow(QMainWindow):
                     # 結果を保存
                     results.append(
                         {
-                            "mask_index": idx,
-                            "area": area,
-                            "obb_width": width,
-                            "obb_height": height,
-                            "obb_angle": angle,
+                            "image_filename": os.path.basename(self.current_img),
+                            "particle_id": f"P{idx}" if shape.label.lower() == "primary" else f"S{idx}",
+                            "secondary_components": "",  # 二次粒子の場合、含まれる一次粒子IDをカンマ区切りで入れる
+                            "particle_type": shape.label.lower() if shape.label.lower() in ["primary", "secondary"] else "primary",
+                            "Lmajor [um]": max(width, height) * float(self.image_scaler_edit.text() or "1.0"),
+                            "Lminor [um]": min(width, height) * float(self.image_scaler_edit.text() or "1.0"),
+                            "area [um^2]": area * (float(self.image_scaler_edit.text() or "1.0") ** 2),
+                            "angle [deg]": angle
                         }
                     )
             else:
