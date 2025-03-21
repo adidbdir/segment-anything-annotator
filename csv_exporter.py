@@ -42,7 +42,7 @@ def export_csv(results, experiment_params, output_folder):
     filename = construct_csv_filename(experiment_params)
     csv_path = os.path.join(output_folder, filename)
     
-    fieldnames = ["mask_index", "area", "obb_width", "obb_height", "obb_angle"]
+    fieldnames =  ["image_filename", "particle_id", "secondary_components", "particle_type", "Lmajor [um]", "Lminor [um]"]
     with open(csv_path, mode="w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()

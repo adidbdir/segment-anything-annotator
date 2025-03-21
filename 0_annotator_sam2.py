@@ -1,0 +1,1849 @@
+import sys
+import functools
+import cv2
+import glob
+import os
+import os.path as osp
+import imgviz
+import html
+import json
+import math
+import argparse
+import numpy as np
+import tempfile
+import torch
+import base64
+import csv
+
+from PyQt5.QtWidgets import QWidget, QApplication, QMainWindow, QApplication, QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, QScrollArea, QDockWidget, QMessageBox, QLineEdit
+from PyQt5.QtGui import QPixmap, QIcon, QImage
+from PyQt5.Qt import QSize
+from qtpy.QtCore import Qt
+from qtpy import QtCore
+from qtpy import QtGui, QtWidgets
+from canvas import Canvas
+import utils
+from utils.download_model import download_model
+
+from labelme.widgets import ToolBar, UniqueLabelQListWidget, LabelDialog, LabelListWidget, LabelListWidgetItem, ZoomWidget
+from labelme import PY2
+from labelme.label_file import LabelFile
+from labelme.label_file import LabelFileError
+
+
+from shape import Shape
+
+from PIL import Image
+
+from collections import namedtuple
+Click = namedtuple('Click', ['is_positive', 'coords'])
+
+# from segment_anything import sam_model_registry, SamPredictor
+# sys.path.append('../sam2')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'external', 'sam2')))
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+import csv_exporter
+from icecream import ic
+
+LABEL_COLORMAP = imgviz.label_colormap()
+
+class MainWindow(QMainWindow):
+
+    FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = 0, 1, 2
+
+    def __init__(self, parent=None, global_w=1000, global_h=1800, model_type='vit_b', keep_input_size=True, max_size=1080, category_file='primary.txt'):
+        super(MainWindow, self).__init__(parent)
+        self.resize(global_w, global_h)
+        self.model_type = model_type
+        self.keep_input_size = keep_input_size
+        self.max_size = float(max_size)
+        self.category_file = category_file
+
+        self.setWindowTitle('segment-anything-annotator')
+        self.canvas = Canvas(self,
+            epsilon=10.0,
+            double_click='close',
+            num_backups=10,
+            app=self,
+        )
+
+        
+        self._noSelectionSlot = False
+        self.current_output_dir = 'output'
+        os.makedirs(self.current_output_dir, exist_ok=True)
+        self.current_output_filename = ''
+        self.canvas.zoomRequest.connect(self.zoomRequest)
+
+        self.memory_shapes = []
+        self.image = []
+        self.image_np = []
+        self.masks = []
+        self.sam_mask = []
+        self.sam_mask_proposal = []
+        self.image_encoded_flag = False
+        self.min_point_dis = 4
+
+        self.predictor = None
+
+        self.scroll_values = {
+            Qt.Horizontal: {},
+            Qt.Vertical: {},
+        }
+        self.scrollArea = QScrollArea(self)
+        self.scrollArea.setWidget(self.canvas)
+        self.scrollArea.setWidgetResizable(True)
+        self.scrollBars = {
+            Qt.Vertical: self.scrollArea.verticalScrollBar(),
+            Qt.Horizontal: self.scrollArea.horizontalScrollBar(),
+        }
+        self.canvas.scrollRequest.connect(self.scrollRequest)
+        self.canvas.newShape.connect(self.newShape)
+        self.canvas.shapeMoved.connect(self.setDirty)
+        self.canvas.selectionChanged.connect(self.shapeSelectionChanged)
+        self.canvas.drawingPolygon.connect(self.toggleDrawingSensitive)
+
+        self.uniqLabelList = UniqueLabelQListWidget()
+        self.uniqLabelList.setToolTip(
+            self.tr(
+                "Select label to start annotating for it. "
+                "Press 'Esc' to deselect."
+            )
+        )
+        self.labelDialog = LabelDialog(
+            parent=self,
+            labels=[],
+            sort_labels=False,
+            show_text_field=True,
+            completion='contains',
+            fit_to_content={'column': True, 'row': False},
+        )
+
+        self.labelList = LabelListWidget()
+        self.labelList.itemSelectionChanged.connect(self.labelSelectionChanged)
+        self.labelList.itemDoubleClicked.connect(self.editLabel)
+        self.labelList.itemChanged.connect(self.labelItemChanged)
+        self.labelList.itemDropped.connect(self.labelOrderChanged)
+
+        self.shape_dock = QDockWidget(
+            self.tr("Polygon Labels"), self
+        )
+        self.shape_dock.setObjectName("Labels")
+        self.shape_dock.setWidget(self.labelList)
+
+        self.category_list = [i.strip() for i in open('categories.txt', 'r', encoding='utf-8').readlines()]
+        self.labelDialog = LabelDialog(
+            parent=self,
+            labels=self.category_list,
+            sort_labels=False,
+            show_text_field=True,
+            completion='contains',
+            fit_to_content={'column': True, 'row': False},
+        )
+        self.zoom_values = {}
+        self.video_directory = ''
+        self.video_list = []
+        self.video_len = len(self.video_list)
+
+        self.img_list = []
+        self.img_len = len(self.img_list)
+        self.current_img_index = 0
+        self.current_img = ''
+        self.current_img_data = ''
+
+        self.button_next = QPushButton('Next Image', self)
+        self.button_next.clicked.connect(self.clickButtonNext)
+        self.button_last = QPushButton('Last Image', self)
+        self.button_last.clicked.connect(self.clickButtonLast)
+
+        self.img_progress_bar = QProgressBar(self)
+        self.img_progress_bar.setMinimum(0)
+        self.img_progress_bar.setMaximum(1)
+        self.img_progress_bar.setValue(0)
+        self.button_proposal1 = QPushButton('Proposal1', self)
+        self.button_proposal1.clicked.connect(self.choose_proposal1)
+        self.button_proposal1.setShortcut('1')
+        self.button_proposal2 = QPushButton('Proposal2', self)
+        self.button_proposal2.clicked.connect(self.choose_proposal2)
+        self.button_proposal2.setShortcut('2')
+        self.button_proposal3 = QPushButton('Proposal3', self)
+        self.button_proposal3.clicked.connect(self.choose_proposal3)
+        self.button_proposal3.setShortcut('3')
+        self.button_proposal4 = QPushButton('Proposal4', self)
+        self.button_proposal4.clicked.connect(self.choose_proposal4)
+        self.button_proposal4.setShortcut('4')
+        self.button_proposal_list = [self.button_proposal1, self.button_proposal2, self.button_proposal3, self.button_proposal4]
+        
+        self.class_on_flag = True
+        self.class_on_text = QLabel("Class On", self)
+        
+        # secondary のグループ分けを行う
+        self.grouping_complete = False  # グループ分けフラグを追加
+        self.grouped_segments = []  # グループ分けされたセグメントを保持するリスト
+        self.group_id = 0
+        self.default_label = None  # default_label を初期化
+
+        #naive layout
+        self.scrollArea.move(int(0.02 * global_w), int(0.08 * global_h))
+        self.scrollArea.resize(int(0.75 * global_w), int(0.7 * global_h))
+        self.shape_dock.move(int(0.79 * global_w), int(0.08 * global_h))
+        self.shape_dock.resize(int(0.2 * global_w), int(0.7 * global_h))
+        self.button_next.move(int(0.18 * global_w), int(0.85 * global_h))
+        self.button_next.resize(int(0.1 * global_w),int(0.04 * global_h))
+        self.button_last.move(int(0.01 * global_w), int(0.85 * global_h))
+        self.button_last.resize(int(0.1 * global_w),int(0.04 * global_h))
+        self.class_on_text.move(int(0.01 * global_w), int(0.9 * global_h))
+        self.img_progress_bar.move(int(0.01 * global_w), int(0.8 * global_h))
+        self.img_progress_bar.resize(int(0.3 * global_w),int(0.04 * global_h))
+        
+        self.button_proposal1.resize(int(0.17 * global_w),int(0.14 * global_h))
+        self.button_proposal1.move(int(0.33 * global_w), int(0.8 * global_h))
+        self.button_proposal2.resize(int(0.17 * global_w),int(0.14 * global_h))
+        self.button_proposal2.move(int(0.50 * global_w), int(0.8 * global_h))
+        self.button_proposal3.resize(int(0.17 * global_w),int(0.14 * global_h))
+        self.button_proposal3.move(int(0.67 * global_w), int(0.8 * global_h))
+        self.button_proposal4.resize(int(0.17 * global_w),int(0.14 * global_h))
+        self.button_proposal4.move(int(0.84 * global_w), int(0.8 * global_h))
+        
+        # add:隠しでパラメータ保持用の QLineEdit を作成（初期値は空）
+        self.date_edit = QtWidgets.QLineEdit()
+        self.experimenter_edit = QtWidgets.QLineEdit()
+        self.impurity_type_edit = QtWidgets.QLineEdit()
+        self.impurity_conc_edit = QtWidgets.QLineEdit()
+        self.seed_size_edit = QtWidgets.QLineEdit()
+        self.crystal_time_edit = QtWidgets.QLineEdit()
+        self.suspension_density_edit = QtWidgets.QLineEdit()
+        self.image_scaler_edit = QtWidgets.QLineEdit()
+        
+        self.zoomWidget = ZoomWidget()
+
+        action = functools.partial(utils.newAction, self)
+        
+        experimentParamsAction = action(
+            self.tr("Experiment Params"),
+            self.showExperimentParamsDialog,
+            None,
+            "objects",
+            self.tr("Set Experiment Parameters"),
+            enabled=True,
+        )
+        GroupSeg = action(
+            self.tr("Group Seg"),
+            lambda: self.clickGroupSeg(),
+            'g',
+            "objects",
+            self.tr("Group Seg"),
+            enabled=True,
+        )
+        categoryFile = action(
+            self.tr("Category File"),
+            lambda: self.clickCategoryChoose(),
+            'None',
+            "objects",
+            self.tr("Category File"),
+            enabled=True,
+        )
+        imageDirectory = action(
+            self.tr("Image Directory"),
+            lambda: self.clickFileChoose(),
+            'None',
+            "objects",
+            self.tr("Image Directory"),
+            enabled=True,
+        )
+        LoadSAM = action(
+            self.tr("Load SAM"),
+            lambda: self.clickLoadSAM(),
+            'None',
+            "objects",
+            self.tr("Load SAM"),
+            enabled=True,
+        )
+        AutoSeg = action(
+            self.tr("AutoSeg"),
+            lambda: self.clickAutoSeg(),
+            'None',
+            "objects",
+            self.tr("AutoSeg"),
+            enabled=False,
+        )
+        promptSeg = action(
+            self.tr("Accept"),
+            lambda: self.addSamMask(),
+            'a',
+            "objects",
+            self.tr("Accept"),
+            enabled=False,
+        )
+
+        saveDirectory = action(
+            self.tr("Save Directory"),
+            lambda: self.clickSaveChoose(),
+            'None',
+            "objects",
+            self.tr("Save Directory"),
+            enabled=True,
+        )
+
+        createMode = action(
+            self.tr("Manual Polygons"),
+            lambda: self.toggleDrawMode(False, createMode="polygon"),
+            'Ctrl+W',
+            "objects",
+            self.tr("Start drawing polygons"),
+            enabled=True,
+        )
+        createPointMode = action(
+            self.tr("Point Prompt"),
+            lambda: self.toggleDrawMode(False, createMode="point"),
+            'None',
+            "objects",
+            self.tr("Point Prompt"),
+            enabled=True,
+        )
+        createRectangleMode = action(
+            self.tr("Box Prompt"),
+            lambda: self.toggleDrawMode(False, createMode="rectangle"),
+            'None',
+            "objects",
+            self.tr("Box Prompt"),
+            enabled=True,
+        )
+        cleanPrompt = action(
+            self.tr("Reject"),
+            lambda: self.cleanPrompt(),
+            'r',
+            "objects",
+            self.tr("Reject"),
+            enabled=True,
+        )
+        
+        self.switchClass = action(
+            self.tr("Class On/Off"),
+            lambda: self.clickSwitchClass(),
+            'none',
+            "objects",
+            self.tr("Class On/Off"),
+            enabled=True,
+        )
+
+        editMode = action(
+            self.tr("Edit Polygons"),
+            self.setEditMode,
+            'e',
+            "edit",
+            self.tr("Move and edit the selected polygons"),
+            enabled=False,
+        )
+        saveAs = action(
+            self.tr("&Save As"),
+            self.saveFileAs,
+            'ALT+s',
+            "save-as",
+            self.tr("Save labels to a different file"),
+            enabled=True,
+        )
+
+        undoLastPoint = action(
+            self.tr("Undo last point"),
+            self.canvas.undoLastPoint,
+            'U',
+            "undo",
+            self.tr("Undo last drawn point"),
+            enabled=False,
+        )
+
+        hideAll = action(
+            self.tr("&Hide\nPolygons"),
+            functools.partial(self.togglePolygons, False),
+            icon="eye",
+            tip=self.tr("Hide all polygons"),
+            enabled=False,
+        )
+        showAll = action(
+            self.tr("&Show\nPolygons"),
+            functools.partial(self.togglePolygons, True),
+            icon="eye",
+            tip=self.tr("Show all polygons"),
+            enabled=False,
+        )
+
+        undo = action(
+            self.tr("Undo"),
+            self.undoShapeEdit,
+            'Ctrl+U',
+            "undo",
+            self.tr("Undo last add and edit of shape"),
+            enabled=False,
+        )
+
+        save = action(
+            self.tr("&Save"),
+            self.saveFile,
+            'S',
+            "save",
+            self.tr("Save labels to file"),
+            enabled=False,
+        )
+
+        delete = action(
+            self.tr("Delete Polygons"),
+            self.deleteSelectedShape,
+            'd',
+            "cancel",
+            self.tr("Delete the selected polygons"),
+            enabled=False,
+        )
+        duplicate = action(
+            self.tr("Duplicate Polygons"),
+            self.duplicateSelectedShape,
+            'None',
+            "copy",
+            self.tr("Create a duplicate of the selected polygons"),
+            enabled=False,
+        )
+        reduce_point = action(
+            self.tr("Reduce Points"),
+            self.reducePoint,
+            'None',
+            "copy",
+            self.tr("Reduce Points"),
+            enabled=True,
+        )            
+        edit = action(
+            self.tr("&Edit Label"),
+            self.editLabel,
+            'None',
+            "edit",
+            self.tr("Modify the label of the selected polygon"),
+            enabled=False,
+        )
+        
+
+        self.actions = utils.struct(
+            categoryFile=categoryFile,
+            imageDirectory=imageDirectory,
+            saveDirectory=saveDirectory,
+            switchClass=self.switchClass,
+            loadSAM=LoadSAM,
+            #autoSeg=AutoSeg,
+            promptSeg=promptSeg,
+            cleanPrompt=cleanPrompt,
+            createMode=createMode,
+            createPointMode=createPointMode,
+            createRectangleMode=createRectangleMode,
+            editMode=editMode,
+            undoLastPoint=undoLastPoint,
+            undo=undo,
+            delete=delete,
+            edit=edit,
+            duplicate=duplicate,
+            reduce_point=reduce_point,
+            save=save,
+            onShapesPresent=(saveAs, hideAll, showAll),
+            menu=(
+                createMode,
+                editMode,
+                undoLastPoint,
+                undo,
+                save,
+            )
+        )
+
+        # Custom context menu for the canvas widget:
+        utils.addActions(self.canvas.menus[0], self.actions.menu)
+        utils.addActions(
+            self.canvas.menus[1],
+            (
+                action("&Copy here", self.copyShape),
+                action("&Move here", self.moveShape),
+            ),
+        )
+
+        self.toolbar = self.addToolBar('Tool')
+        self.toolbar.addAction(experimentParamsAction)
+        self.toolbar.addAction(categoryFile)
+        self.toolbar.addAction(imageDirectory)
+        self.toolbar.addAction(saveDirectory)
+        self.toolbar.addAction(self.switchClass)
+        self.toolbar.addAction(LoadSAM)
+        #self.toolbar.addAction(AutoSeg)
+        self.toolbar.addAction(promptSeg)
+        self.toolbar.addAction(cleanPrompt)
+        self.toolbar.addAction(createMode)
+        self.toolbar.addAction(createPointMode)
+        self.toolbar.addAction(createRectangleMode)
+        self.toolbar.addAction(editMode)
+        self.toolbar.addAction(undoLastPoint)
+        self.toolbar.addAction(undo)
+        self.toolbar.addAction(delete)
+        self.toolbar.addAction(edit)
+        self.toolbar.addAction(duplicate)
+        self.toolbar.addAction(reduce_point)
+        self.toolbar.addAction(GroupSeg)
+        self.toolbar.addAction(save)
+        self.toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+
+        zoom = QtWidgets.QWidgetAction(self)
+        zoom.setDefaultWidget(self.zoomWidget)
+        self.zoomWidget.setWhatsThis(
+            str(
+                self.tr(
+                    "Zoom in or out of the image. Also accessible with "
+                    "{} from the canvas."
+                )
+            ).format(
+                #utils.fmtShortcut(
+                #    "{},{}".format(shortcuts["zoom_in"], shortcuts["zoom_out"])
+                #),
+                utils.fmtShortcut(self.tr("Ctrl+Wheel")),
+            )
+        )
+        self.zoomWidget.setEnabled(True)
+
+        self.zoomWidget.valueChanged.connect(self.paintCanvas)
+        self.canvas.actions = self.actions
+    
+    def exportCSVResults(self):
+        """
+        現在の画像について、self.sam_mask（もしくは他の適切なマスクリスト）から
+        解析結果を計算し、csv_exporter を利用して CSV 出力する。
+        CSV のファイル名は、実験パラメータ（date, experimenter, impurity_type, impurity_concentration,
+        seed_size, crystallization_time, suspension_density, image_scaler）から構築する。
+        """
+        if not self.current_img:
+            QMessageBox.warning(self, self.tr("Warning"), self.tr("No image loaded"))
+            return None, None, None
+        
+        # 一次粒子と二次粒子を分けて格納するディクショナリ
+        primary_particles = {}  # ID → 粒子情報
+        secondary_particles = {}  # グループID → 粒子情報
+        
+        # グループIDから所属する一次粒子IDのマッピング
+        group_to_primary_ids = {}
+        
+        visualized_image = self.image_np.copy()
+        
+        # まず一次粒子を処理
+        for idx, mask in enumerate(self.masks):
+            # マスクを2次元のuint8形式に変換
+            binary_mask = mask.squeeze().astype(np.uint8)
+
+            # マスクが空でないか確認
+            if np.any(binary_mask):
+                contours, _ = cv2.findContours(
+                    binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+
+                for contour in contours:
+                    # 面積でフィルタリング
+                    area = cv2.contourArea(contour)
+                    if area < 10:  # 面積が小さい場合はスキップ
+                        print(f"Mask {idx}: Skipped due to small area ({area}).")
+                        continue
+
+                    # Oriented Bounding Box (OBB)
+                    rect = cv2.minAreaRect(contour)
+                    (cx, cy), (width, height), angle = rect
+
+                    if width == 0 or height == 0:  # 幅または高さが0の場合スキップ
+                        print(
+                            f"Mask {idx}: Skipped due to invalid OBB dimensions (width={width}, height={height})."
+                        )
+                        continue
+
+                    # OBBの四角形を取得
+                    box = cv2.boxPoints(rect)
+                    box = np.intp(box)
+                    cv2.drawContours(
+                        visualized_image, [box], 0, (0, 255, 255), 2
+                    )  # 黄色でOBBを描画
+
+                    # OBBの中心から両矢印で幅と高さを描画
+                    center = (int(cx), int(cy))
+                    angle_rad = np.radians(angle)
+
+                    width_vector = (
+                        (width / 2) * np.cos(angle_rad),
+                        (width / 2) * np.sin(angle_rad),
+                    )
+                    height_vector = (
+                        (height / 2) * np.sin(angle_rad),
+                        -(height / 2) * np.cos(angle_rad),
+                    )
+
+                    width_arrow_start = (
+                        int(cx - width_vector[0]),
+                        int(cy - width_vector[1]),
+                    )
+                    width_arrow_end = (
+                        int(cx + width_vector[0]),
+                        int(cy + width_vector[1]),
+                    )
+
+                    height_arrow_start = (
+                        int(cx - height_vector[0]),
+                        int(cy - height_vector[1]),
+                    )
+                    height_arrow_end = (
+                        int(cx + height_vector[0]),
+                        int(cy + height_vector[1]),
+                    )
+
+                    # 両矢印を描画 (幅: 緑, 高さ: ピンク)
+                    cv2.arrowedLine(
+                        visualized_image,
+                        width_arrow_start,
+                        width_arrow_end,
+                        (0, 255, 0),
+                        2,
+                        tipLength=0.1,
+                    )
+                    cv2.arrowedLine(
+                        visualized_image,
+                        width_arrow_end,
+                        width_arrow_start,
+                        (0, 255, 0),
+                        2,
+                        tipLength=0.1,
+                    )
+                    cv2.arrowedLine(
+                        visualized_image,
+                        height_arrow_start,
+                        height_arrow_end,
+                        (255, 105, 180),
+                        2,
+                        tipLength=0.1,
+                    )
+                    cv2.arrowedLine(
+                        visualized_image,
+                        height_arrow_end,
+                        height_arrow_start,
+                        (255, 105, 180),
+                        2,
+                        tipLength=0.1,
+                    )
+
+                    # ラベル（ID）を描画
+                    label_position = (int(cx), int(cy) - 10)
+                    cv2.putText(
+                        visualized_image,
+                        f"ID:{idx}",
+                        label_position,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 0, 255),
+                        2,
+                    )
+                    
+                    # 結果を保存
+                    lmajor = max(width, height) * float(self.image_scaler_edit.text() or "1.0")
+                    lminor = min(width, height) * float(self.image_scaler_edit.text() or "1.0")
+                    area_um = area * float(self.image_scaler_edit.text() or "1.0")**2
+                    
+                    # 一次粒子情報を保存
+                    primary_particles[idx] = {
+                        "image_filename": os.path.basename(self.current_img),
+                        "particle_id": idx,
+                        "secondary_id": None,  # 後で更新
+                        "particle_type": "primary",
+                        "Lmajor [um]": lmajor,
+                        "Lminor [um]": lminor,
+                        "L[um]": (lmajor + lminor) / 2,  # 平均長さ
+                        "area": area_um,
+                        "contour": contour,  # 後で面積計算などに使用
+                    }
+            else:
+                print(f"Mask {idx} is empty and skipped.")
+        
+        # グループ化された形状（二次粒子）の処理
+        # Shape オブジェクトからLabelListWidgetItemを取得するための辞書
+        shape_to_item = {item.shape(): item for item in self.labelList}
+        
+        # 各一次粒子がどの二次粒子に属しているかを確認
+        for item in self.labelList:
+            shape = item.shape()
+            
+            # group_idがNoneでない場合、そのグループに属している
+            if shape.group_id is not None and shape.label == "secondary":
+                # グループIDが存在しない場合は初期化
+                if shape.group_id not in group_to_primary_ids:
+                    group_to_primary_ids[shape.group_id] = []
+                
+                # このグループに属する一次粒子を探す
+                for primary_id, primary_info in primary_particles.items():
+                    # 主粒子の輪郭と二次粒子の形状が重なるかをチェック
+                    # 現在はシンプルに所属関係を処理するため、一次粒子のIDをグループに追加
+                    primary_info["secondary_id"] = shape.group_id
+                    group_to_primary_ids[shape.group_id].append(primary_id)
+        
+        # 二次粒子の情報を計算
+        for group_id, primary_ids in group_to_primary_ids.items():
+            if not primary_ids:  # 一次粒子がない場合はスキップ
+                continue
+                
+            # このグループに属する一次粒子の統計情報を計算
+            lmajor_values = [primary_particles[pid]["Lmajor [um]"] for pid in primary_ids]
+            lminor_values = [primary_particles[pid]["Lminor [um]"] for pid in primary_ids]
+            l_values = [primary_particles[pid]["L[um]"] for pid in primary_ids]
+            area_values = [primary_particles[pid]["area"] for pid in primary_ids]
+            
+            # 二次粒子の寸法は、含まれる一次粒子の最大の長さと幅を使用
+            combined_contours = np.vstack([primary_particles[pid]["contour"] for pid in primary_ids])
+            rect = cv2.minAreaRect(combined_contours)
+            (cx, cy), (width, height), angle = rect
+            
+            lmajor_secondary = max(width, height) * float(self.image_scaler_edit.text() or "1.0")
+            lminor_secondary = min(width, height) * float(self.image_scaler_edit.text() or "1.0")
+            
+            # 総面積を計算（簡易的な実装）
+            total_area = sum(area_values)
+            
+            # 平均サイズを計算
+            lmean = sum(l_values) / len(l_values)
+            
+            # 凝集度（Aggregation）の計算 - 二次粒子の大きさ/一次粒子の平均大きさ
+            n_particles = len(primary_ids)
+            aggregation = ((lmajor_secondary + lminor_secondary) / 2) / lmean if lmean > 0 else 0
+            
+            # 二次粒子情報を保存
+            secondary_particles[group_id] = {
+                "image_filename": os.path.basename(self.current_img),
+                "particle_id": ",".join(map(str, primary_ids)),  # コンマ区切りの一次粒子ID
+                "secondary_id": group_id,
+                "particle_type": "secondary",
+                "Lmajor [um]": lmajor_secondary,
+                "Lminor [um]": lminor_secondary,
+                "L[um]": (lmajor_secondary + lminor_secondary) / 2,
+                "Lmean[um]": lmean,
+                "n": n_particles,
+                "Agg.": round(aggregation, 2),
+                "Area[um^2]": round(total_area, 2),
+            }
+        
+        # 可視化画像を保存
+        visualized_image_path = (f"{self.current_img}_visualized.jpg")
+        cv2.imwrite(
+            visualized_image_path, cv2.cvtColor(visualized_image, cv2.COLOR_RGB2BGR)
+        )
+        print(f"visualized_image_path: {visualized_image_path}")
+
+        # 結果を整形してCSVエクスポーター用に準備
+        results = []
+        
+        # まず一次粒子の結果を追加
+        for primary_id, primary_info in primary_particles.items():
+            # 不要なフィールドを削除
+            primary_result = primary_info.copy()
+            primary_result.pop("contour", None)
+            primary_result.pop("area", None)
+            
+            # CSVに出力するフィールドを整形
+            results.append({
+                "image_filename": primary_result["image_filename"],
+                "particle_id": primary_result["particle_id"],
+                "secondary_id": primary_result["secondary_id"] or "",
+                "particle_type": primary_result["particle_type"],
+                "Lmajor [um]": round(primary_result["Lmajor [um]"], 3),
+                "Lminor [um]": round(primary_result["Lminor [um]"], 3),
+                "L[um]": round(primary_result["L[um]"], 1),
+                "Lmean[um]": "",
+                "n": "",
+                "Agg.": "",
+                "Area[um^2]": round(primary_result.get("area", 0), 2),
+            })
+        
+        # 次に二次粒子の結果を追加
+        for group_id, secondary_info in secondary_particles.items():
+            results.append({
+                "image_filename": secondary_info["image_filename"],
+                "particle_id": secondary_info["particle_id"],
+                "secondary_id": secondary_info["secondary_id"],
+                "particle_type": secondary_info["particle_type"],
+                "Lmajor [um]": round(secondary_info["Lmajor [um]"], 3),
+                "Lminor [um]": round(secondary_info["Lminor [um]"], 3),
+                "L[um]": round(secondary_info["L[um]"], 1),
+                "Lmean[um]": round(secondary_info["Lmean[um]"], 1),
+                "n": secondary_info["n"],
+                "Agg.": secondary_info["Agg."],
+                "Area[um^2]": secondary_info["Area[um^2]"],
+            })
+
+        if not results:
+            QMessageBox.information(self, self.tr("Info"), self.tr("No valid masks for analysis."))
+            return None, None, None
+        
+        # 実験パラメータの取得（showExperimentParamsDialog で更新された隠し QLineEdit から）
+        experiment_params = {
+            "date": self.date_edit.text(),
+            "experimenter": self.experimenter_edit.text(),
+            "impurity_type": self.impurity_type_edit.text(),
+            "impurity_concentration": self.impurity_conc_edit.text(),
+            "seed_size": self.seed_size_edit.text(),
+            "crystallization_time": self.crystal_time_edit.text(),
+            "suspension_density": self.suspension_density_edit.text(),
+            "image_scaler": self.image_scaler_edit.text(),
+        }
+        return results, experiment_params, self.current_output_dir
+    
+    def saveFileAs(self, _value=False):
+        assert not self.image.isNull(), "cannot save empty image"
+        self._saveFile(self.saveFileDialog())
+
+    def saveFile(self, _value=False):
+        # assert not self.image.isNull(), "cannot save empty image"
+        # if self.labelFile:
+        #     # DL20180323 - overwrite when in directory
+        #     self._saveFile(self.labelFile.filename)
+        # elif self.output_file:
+        #     self._saveFile(self.output_file)
+        #     self.close()
+        # else:
+        #     self._saveFile(self.saveFileDialog())
+        #self._saveFile(self.saveFileDialog())
+        #print(self.current_output_filename)
+        results, experiment_params, output_dir = self.exportCSVResults()
+        if results is not None and experiment_params is not None and output_dir is not None:
+            csv_exporter.export_csv(results, experiment_params, output_dir)
+            self._saveFile(self.current_output_filename)
+        else:
+            # エラーメッセージは既に exportCSVResults 内で表示されているので、ここでは何もしない
+            pass
+        self._saveFile(self.current_output_filename)
+
+    def _saveFile(self, filename):
+        if filename and self.saveLabels(filename):
+            self.setClean()
+
+    def saveLabels(self, filename):
+        lf = LabelFile()
+
+        def format_shape(s):
+            data = s.other_data.copy()
+            data.update(
+                dict(
+                    label=s.label.encode("utf-8") if PY2 else s.label,
+                    points=[[p.x(), p.y()] for p in s.points],
+                    group_id=s.group_id,
+                    description="",
+                    shape_type=s.shape_type,
+                    flags=s.flags,
+                )
+            )
+            return data
+
+        shapes = [format_shape(item.shape()) for item in self.labelList]
+        imageData = base64.b64encode(self.current_img_data).decode("utf-8")
+        save_data = {
+            "version": "1.0.0",
+            "flags": {},
+            "shapes": shapes,
+            "imagePath": self.current_img,
+            "imageData": imageData,
+            "imageHeight": self.raw_h,
+            "imageWidth": self.raw_w,
+            "experiment_params": {  # 実験パラメータの追加
+                "date": self.date_edit.text(),
+                "experimenter": self.experimenter_edit.text(),
+                "impurity_type": self.impurity_type_edit.text(),
+                "impurity_concentration": self.impurity_conc_edit.text(),
+                "seed_size": self.seed_size_edit.text(),
+                "crystallization_time": self.crystal_time_edit.text(),
+                "suspension_density": self.suspension_density_edit.text(),
+                "image_scaler": self.image_scaler_edit.text(),
+            }
+        }
+
+        with open(filename, 'w') as f:
+            json.dump(save_data, f)
+        return True
+
+    def setClean(self):
+        self.dirty = False
+        self.actions.save.setEnabled(False)
+        self.actions.createMode.setEnabled(True)
+
+    def saveFileDialog(self):
+        caption = self.tr("Choose File")
+        filters = self.tr("Label files")
+        if self.output_dir:
+            dlg = QtWidgets.QFileDialog(
+                self, caption, self.output_dir, filters
+            )
+        else:
+            dlg = QtWidgets.QFileDialog(
+                self, caption, self.currentPath(), filters
+            )
+        dlg.setDefaultSuffix(LabelFile.suffix[1:])
+        dlg.setAcceptMode(QtWidgets.QFileDialog.AcceptSave)
+        dlg.setOption(QtWidgets.QFileDialog.DontConfirmOverwrite, False)
+        dlg.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, False)
+        basename = os.path.basename(self.current_img)[:-4]
+        if self.output_dir:
+            default_labelfile_name = osp.join(
+                self.output_dir, basename + LabelFile.suffix
+            )
+        else:
+            default_labelfile_name = osp.join(
+                self.currentPath(), basename + LabelFile.suffix
+            )
+        filename = dlg.getSaveFileName(
+            self,
+            self.tr("Choose File"),
+            default_labelfile_name,
+            self.tr("Label files (*%s)") % LabelFile.suffix,
+        )
+        if isinstance(filename, tuple):
+            filename, _ = filename
+        return filename
+
+    def currentPath(self):
+        #return osp.dirname(str(self.filename)) if self.filename else "."
+        return "."
+
+    def loadAnno(self, filename):
+        with open(filename,'r') as f:
+            data = json.load(f)
+        for shape in data['shapes']:
+            label = shape["label"]
+            try:
+                ttt = int(label)
+                label = self.category_list[ttt]
+            except:
+                pass
+
+            points = shape["points"]
+            shape_type = shape["shape_type"]
+            flags = shape["flags"]
+            group_id = shape["group_id"]
+            if not points:
+                # skip point-empty shape
+                continue
+            shape = Shape(
+                label=label,
+                shape_type=shape_type,
+                group_id=group_id,
+                flags=flags
+            )
+            for x, y in points:
+                shape.addPoint(QtCore.QPointF(x, y))
+            shape.close()
+            self.addLabel(shape)
+        self.canvas.loadShapes([item.shape() for item in self.labelList])
+
+    def clickButtonNext(self):
+        if self.actions.save.isEnabled():
+            self.saveFile()
+        if not self.grouping_complete:  # グループ分けが完了していない場合
+            QMessageBox.warning(self, self.tr("Warning"), self.tr("Please complete grouping before moving to the next image."))
+            return
+        if self.current_img_index < self.img_len - 1:
+            self.current_img_index += 1
+            self.current_img = self.img_list[self.current_img_index]
+            self.loadImg()
+
+    def clickButtonLast(self):
+        if self.actions.save.isEnabled():
+            self.saveFile()
+        if self.current_img_index > 0:
+            self.current_img_index -= 1
+            self.current_img = self.img_list[self.current_img_index]
+            self.loadImg()
+
+
+    def choose_proposal1(self):
+        if len(self.sam_mask_proposal) > 0:
+            self.sam_mask = self.sam_mask_proposal[0]
+            self.canvas.setHiding()
+            self.canvas.update()
+
+    def choose_proposal2(self):
+        if len(self.sam_mask_proposal) > 1:
+            self.sam_mask = self.sam_mask_proposal[1]
+            self.canvas.setHiding()
+            self.canvas.update()
+            
+    def choose_proposal3(self):
+        if len(self.sam_mask_proposal) > 2:
+            self.sam_mask = self.sam_mask_proposal[2]
+            self.canvas.setHiding()
+            self.canvas.update()
+            
+    def choose_proposal4(self):
+        if len(self.sam_mask_proposal) > 3:
+            self.sam_mask = self.sam_mask_proposal[3]
+            self.canvas.setHiding()
+            self.canvas.update()    
+            
+    def loadImg(self):
+        self.image = Image.open(self.current_img)
+        self.image_np = np.array(self.image.convert("RGB"))
+        self.raw_h, self.raw_w = cv2.imread(self.current_img).shape[:2]
+        pixmap = QPixmap(self.current_img)
+        #pixmap = pixmap.scaled(int(0.75 * global_w), int(0.7 * global_h))
+        self.canvas.loadPixmap(pixmap)
+        self.img_progress_bar.setValue(self.current_img_index)
+
+        img_name = os.path.basename(self.current_img)[:-4]
+        self.current_output_filename = osp.join(self.current_output_dir, img_name + '.json')
+        self.labelList.clear()
+        if os.path.isfile(self.current_output_filename):
+            self.loadAnno(self.current_output_filename)
+        self.image_encoded_flag = False
+        self.current_img_data = LabelFile.load_image_file(self.current_img)
+
+
+    def clickFileChoose(self):
+        directory = QFileDialog.getExistingDirectory(self, 'choose target fold','.')
+        if directory == '':
+            return
+        #self.img_list = glob.glob(directory + '/*.{jpg,png,JPG,PNG}')
+        self.img_list = glob.glob(directory + '/*.jpg') + glob.glob(directory + '/*.png')
+        self.img_list.sort()
+        self.img_len = len(self.img_list)
+        if self.img_len == 0:
+            return
+        self.current_img_index = 0
+        self.current_img = self.img_list[self.current_img_index]
+        self.img_progress_bar.setMinimum(0)
+        self.img_progress_bar.setMaximum(self.img_len-1)
+        self.loadImg()
+
+    def clickSaveChoose(self):
+        directory = QFileDialog.getExistingDirectory(self, 'choose target fold','.')
+        if directory == '':
+            return
+        else:
+            self.current_output_dir = directory
+            os.makedirs(self.current_output_dir, exist_ok=True)
+            self.loadImg()
+            return directory
+
+
+    def clickSwitchClass(self):
+        if self.class_on_flag:
+            self.class_on_flag = False
+            self.class_on_text.setText('Class Off')
+        else:
+            self.class_on_flag = True
+            self.class_on_text.setText('Class On')
+
+    def showExperimentParamsDialog(self):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(self.tr("Experiment Parameters"))
+        form_layout = QtWidgets.QFormLayout(dialog)
+        
+        # ダイアログ用のローカルな入力欄を作成し，既存の隠し QLineEdit の内容で初期化
+        date_edit = QtWidgets.QLineEdit(self.date_edit.text())
+        experimenter_edit = QtWidgets.QLineEdit(self.experimenter_edit.text())
+        impurity_type_edit = QtWidgets.QLineEdit(self.impurity_type_edit.text())
+        impurity_conc_edit = QtWidgets.QLineEdit(self.impurity_conc_edit.text())
+        seed_size_edit = QtWidgets.QLineEdit(self.seed_size_edit.text())
+        crystal_time_edit = QtWidgets.QLineEdit(self.crystal_time_edit.text())
+        suspension_density_edit = QtWidgets.QLineEdit(self.suspension_density_edit.text())
+        image_scaler_edit = QtWidgets.QLineEdit(self.image_scaler_edit.text())
+        
+        form_layout.addRow(self.tr("日付:"), date_edit)
+        form_layout.addRow(self.tr("実験者:"), experimenter_edit)
+        form_layout.addRow(self.tr("夾雑イオン種類:"), impurity_type_edit)
+        form_layout.addRow(self.tr("夾雑イオン濃度（比）:"), impurity_conc_edit)
+        form_layout.addRow(self.tr("種晶の大きさ:"), seed_size_edit)
+        form_layout.addRow(self.tr("晶析時間:"), crystal_time_edit)
+        form_layout.addRow(self.tr("懸濁密度:"), suspension_density_edit)
+        form_layout.addRow(self.tr("画像のスケーラー:"), image_scaler_edit)
+        
+        # OK/Cancel ボタン
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        form_layout.addRow(button_box)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            # ユーザー入力で更新された値を隠し QLineEdit に反映
+            self.date_edit.setText(date_edit.text())
+            self.experimenter_edit.setText(experimenter_edit.text())
+            self.impurity_type_edit.setText(impurity_type_edit.text())
+            self.impurity_conc_edit.setText(impurity_conc_edit.text())
+            self.seed_size_edit.setText(seed_size_edit.text())
+            self.crystal_time_edit.setText(crystal_time_edit.text())
+            self.suspension_density_edit.setText(suspension_density_edit.text())
+            self.image_scaler_edit.setText(image_scaler_edit.text())
+
+    def clickCategoryChoose(self):
+        if self.category_file is not None:
+            filename = self.category_file
+        else:
+            filename, _ = QFileDialog.getOpenFileName(self, 'choose target file','.')
+        try:
+            with open(filename, 'r') as f:
+                data = f.readlines()
+                self.category_list = [i.strip() for i in data]
+                self.category_list.sort()
+                if len(self.category_list) == 1:  # カテゴリーが1つの場合
+                    self.default_label = self.category_list[0]  # 自動的にそのラベルを設定
+                else:
+                    self.default_label = None  # 複数の場合はNoneに設定
+                self.labelDialog = LabelDialog(
+                    parent=self,
+                    labels=self.category_list,
+                    sort_labels=False,
+                    show_text_field=True,
+                    completion='contains',
+                    fit_to_content={'column': True, 'row': False},
+                )
+        except Exception as e:
+            pass
+
+    def clickLoadSAM(self):
+        download_model(self.model_type)
+        self.sam = build_sam2(config_file='configs/sam2.1/sam2.1_hiera_l.yaml', ckpt_path='external/sam2/checkpoints/sam2.1_hiera_large.pt')
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.sam.to(device=self.device)
+        self.predictor = SAM2ImagePredictor(self.sam)
+        self.actions.loadSAM.setEnabled(False)
+        #self.actions.autoSeg.setEnabled(True)
+        self.actions.promptSeg.setEnabled(True)
+    
+    def clickAutoSeg(self):
+        pass
+    
+    def getMaxId(self):
+        max_id = -1
+        for label in self.labelList:
+            if label.shape().group_id != None:
+                max_id = max(max_id, int(label.shape().group_id))
+        return max_id
+        
+    def show_proposals(self, masks=None, flag=1):
+        if flag != 1:
+            img = cv2.imread(self.current_img)
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            for msk_idx in range(masks.shape[0]):
+                tmp_mask = masks[msk_idx]
+                tmp_vis = img.copy()
+                tmp_vis[tmp_mask > 0] = 0.5 * tmp_vis[tmp_mask > 0] + 0.5 * np.array([30,30,220])
+                tmp_vis = cv2.resize(tmp_vis,(int(0.17 * global_w),int(0.14 * global_h)))
+                tmp_vis = tmp_vis.astype(np.uint8)
+                pixmap = QPixmap.fromImage(QImage(tmp_vis, tmp_vis.shape[1], tmp_vis.shape[0], tmp_vis.shape[1] * 3 , QImage.Format_RGB888))
+                #self.button_proposal_list[msk_idx].setPixmap(pixmap)
+                self.button_proposal_list[msk_idx].setIcon(QIcon(pixmap))
+                self.button_proposal_list[msk_idx].setIconSize(QSize(tmp_vis.shape[1], tmp_vis.shape[0]))
+                self.button_proposal_list[msk_idx].setShortcut(str(msk_idx+1))
+        else:
+            for idx, button_proposal in enumerate(self.button_proposal_list):
+                button_proposal.setText('proprosal{}'.format(idx))
+                button_proposal.setIconSize(QSize(0,0))
+                self.button_proposal_list[idx].setShortcut(str(idx+1))
+
+    def transform_input(self, image, box=None, points=None):
+        if self.keep_input_size == True:
+            return image, box, points
+        else:
+            h,w = image.shape[:2]
+            scale_ratio = self.max_size / max(h,w)
+            image = cv2.resize(image, (int(w*scale_ratio), int(h*scale_ratio)))
+            if box is not None:
+                box = box * scale_ratio
+            if points is not None:
+                points = points * scale_ratio
+            return image, box, points
+    
+    def transform_output(self, masks, size):
+        if self.keep_input_size == True:
+            return masks
+        else:
+            h,w = size
+            N = masks.shape[0]
+            new_masks = np.zeros((N,h,w), dtype=np.uint8)
+            for idx in range(N):
+                new_masks[idx] = cv2.resize(masks[idx], (w,h))
+            return new_masks
+
+    def clickManualSegBBox(self):
+        Box = self.canvas.currentBox
+        if self.predictor is None or self.current_img == '' or Box == None:
+            return
+        # Use .copy() to ensure the array is contiguous with positive strides
+        img = cv2.imread(self.current_img)[:,:,::-1].copy()
+        rh, rw = img.shape[:2]
+        input_box = np.array([Box[0].x(), Box[0].y(), Box[1].x(), Box[1].y()])
+        img, input_box, _ = self.transform_input(img, box=input_box)
+        if self.image_encoded_flag == False:
+            self.predictor.set_image(img)
+            self.image_encoded_flag = True
+        masks, iou_prediction, _ = self.predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=input_box[None, :],
+            multimask_output=True,
+        )
+        self.masks = masks
+        masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
+
+        target_idx = np.argmax(iou_prediction)
+        self.show_proposals(masks, 0)
+        self.sam_mask_proposal = []
+        for msk_idx in range(masks.shape[0]):
+            mask = masks[msk_idx].astype(np.uint8)
+
+            points_list = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[0]
+            shape_type = 'polygon'
+            tmp_sam_mask = []
+            for points in points_list:
+                area = cv2.contourArea(points)
+                if area < 100 and len(points_list) > 1:
+                    continue
+                pointsx = points[:,0,0]
+                pointsy = points[:,0,1]
+
+                shape = Shape(
+                    label='Object',
+                    shape_type=shape_type,
+                    group_id=self.getMaxId() + 1,
+                )
+                for point_index in range(pointsx.shape[0]):
+                    shape.addPoint(QtCore.QPointF(pointsx[point_index], pointsy[point_index]))
+                shape.close()
+                #self.addLabel(shape)
+                tmp_sam_mask.append(shape)
+            if msk_idx == target_idx:
+                self.sam_mask = tmp_sam_mask
+            self.sam_mask_proposal.append(tmp_sam_mask)
+
+
+    def clickManualSegBox(self):
+        ClickPos = self.canvas.currentPos
+        ClickNeg = self.canvas.currentNeg
+        if self.predictor is None or self.current_img == '' or (ClickPos == None and ClickNeg == None):
+            return
+        img = cv2.imread(self.current_img)[:,:,::-1].copy()
+        rh, rw = img.shape[:2]
+
+        input_clicks = []
+        input_types = []
+        if ClickPos != None:
+            for pos in ClickPos:
+                input_clicks.append([int(pos.x()), int(pos.y())])
+                input_types.append(1)
+
+        if ClickNeg != None:
+            for neg in ClickNeg:
+                input_clicks.append([int(neg.x()), int(neg.y())])
+                input_types.append(0)
+        if len(input_clicks) == 0:
+            input_clicks = None
+            input_types = None
+        else:
+            input_clicks = np.array(input_clicks)
+            input_types = np.array(input_types)
+
+        img, _, input_clicks = self.transform_input(img, points=input_clicks)
+
+        if self.image_encoded_flag == False:
+            self.predictor.set_image(img)
+            self.image_encoded_flag = True
+        masks, iou_prediction, _ = self.predictor.predict(
+            point_coords=input_clicks,
+            point_labels=input_types,
+            multimask_output=True,
+        )
+        self.masks = masks
+        masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
+        
+        target_idx = np.argmax(iou_prediction)
+        self.show_proposals(masks,0)
+        self.sam_mask_proposal = []
+        
+        for msk_idx in range(masks.shape[0]):
+            mask = masks[msk_idx].astype(np.uint8)
+            
+            points_list = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[0]
+            shape_type = 'polygon'
+            tmp_sam_mask = []
+            for points in points_list:
+                area = cv2.contourArea(points)
+                if area < 100 and len(points_list) > 1:
+                    continue
+                pointsx = points[:,0,0]
+                pointsy = points[:,0,1]
+
+                shape = Shape(
+                    label='Object',
+                    shape_type=shape_type,
+                    group_id=self.getMaxId() + 1,
+                )
+                for point_index in range(pointsx.shape[0]):
+                    shape.addPoint(QtCore.QPointF(pointsx[point_index], pointsy[point_index]))
+                shape.close()
+                #self.addLabel(shape)
+                tmp_sam_mask.append(shape)
+            if msk_idx == target_idx:
+                self.sam_mask = tmp_sam_mask
+            self.sam_mask_proposal.append(tmp_sam_mask)
+            
+    
+    def addSamMask(self):
+        if len(self.sam_mask) > 0:
+            label = self.default_label if self.default_label else 'Object'  # 自動設定ラベルを使用
+            group_id = self.getMaxId() + 1
+            if self.class_on_flag:
+                xx = self.labelDialog.popUp(
+                    text=label,
+                    flags={},
+                    group_id=group_id,
+                )
+                if len(xx) == 4:
+                    label, _, group_id,_ = xx
+                else:
+                    label, _, group_id = xx
+            if label is None:
+                label = 'Object'
+            if type(group_id) != int:
+                group_id=self.getMaxId() + 1
+            for sam_mask in self.sam_mask:
+                sam_mask.label = label
+                sam_mask.group_id = group_id
+                self.addLabel(sam_mask)
+        self.canvas.currentBox = None
+        self.canvas.currentPos = None
+        self.canvas.currentNeg = None
+        self.sam_mask = []
+        self.sam_mask_proposal = []
+        self.show_proposals()
+        self.canvas.loadShapes([item.shape() for item in self.labelList])
+        self.actions.save.setEnabled(True)
+        self.actions.editMode.setEnabled(True)
+
+
+
+    def cleanPrompt(self):
+        self.canvas.currentBox = None
+        self.canvas.currentPos = None
+        self.canvas.currentNeg = None
+        self.canvas.current = None
+        self.sam_mask = []
+        self.sam_mask_proposal = []
+        self.show_proposals()
+        self.canvas.setHiding()
+        self.canvas.update()
+        self.actions.editMode.setEnabled(True)
+
+
+
+    def zoomRequest(self, delta, pos):
+        canvas_width_old = self.canvas.width()
+        units = 1.1
+        if delta < 0:
+            units = 0.9
+        self.addZoom(units)
+
+        canvas_width_new = self.canvas.width()
+        if canvas_width_old != canvas_width_new:
+            canvas_scale_factor = canvas_width_new / canvas_width_old
+
+            x_shift = round(pos.x() * canvas_scale_factor) - pos.x()
+            y_shift = round(pos.y() * canvas_scale_factor) - pos.y()
+
+            self.setScroll(
+                Qt.Horizontal,
+                self.scrollBars[Qt.Horizontal].value() + x_shift,
+            )
+            self.setScroll(
+                Qt.Vertical,
+                self.scrollBars[Qt.Vertical].value() + y_shift,
+            )
+
+    def scrollRequest(self, delta, orientation):
+        units = -delta * 0.1  # natural scroll
+        bar = self.scrollBars[orientation]
+        value = bar.value() + bar.singleStep() * units
+        self.setScroll(orientation, value)
+
+    def newShape(self):
+        """Pop-up and give focus to the label editor.
+
+        position MUST be in global coordinates.
+        """
+        items = self.uniqLabelList.selectedItems()
+        text = None
+        if items:
+            text = items[0].data(Qt.UserRole)
+        flags = {}
+        group_id = None
+        if not text:
+            previous_text = self.labelDialog.edit.text()
+            xx = self.labelDialog.popUp(text)
+            if len(xx) == 4:
+                text, flags, group_id, _ = xx
+            else:
+                text, flags, group_id = xx
+            if not text:
+                self.labelDialog.edit.setText(previous_text)
+
+        if text and not self.validateLabel(text):
+            self.errorMessage(
+                self.tr("Invalid label"),
+                self.tr("Invalid label '{}' with validation type '{}'").format(
+                    text, self._config["validate_label"]
+                ),
+            )
+            text = ""
+        if text:
+            self.labelList.clearSelection()
+            shape = self.canvas.setLastLabel(text, flags)
+            shape.group_id = group_id
+            self.addLabel(shape)
+            self.actions.editMode.setEnabled(True)
+            self.actions.undoLastPoint.setEnabled(False)
+            self.actions.undo.setEnabled(True)
+            self.setDirty()
+        else:
+            self.canvas.undoLastLine()
+            self.canvas.shapesBackups.pop()
+
+    def setDirty(self):
+        # Even if we autosave the file, we keep the ability to undo
+        self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
+
+        # if self._config["auto_save"] or self.actions.saveAuto.isChecked():
+        #     label_file = osp.splitext(self.imagePath)[0] + ".json"
+        #     if self.output_dir:
+        #         label_file_without_path = osp.basename(label_file)
+        #         label_file = osp.join(self.output_dir, label_file_without_path)
+        #     self.saveLabels(label_file)
+        #     return
+        # self.dirty = True
+        self.actions.save.setEnabled(True)
+        # title = __appname__
+        # if self.filename is not None:
+        #     title = "{} - {}*".format(title, self.filename)
+        # self.setWindowTitle(title)
+
+    # React to canvas signals.
+    def shapeSelectionChanged(self, selected_shapes):
+        self._noSelectionSlot = True
+        for shape in self.canvas.selectedShapes:
+            shape.selected = False
+        self.labelList.clearSelection()
+        self.canvas.selectedShapes = selected_shapes
+        for shape in self.canvas.selectedShapes:
+            shape.selected = True
+            item = self.labelList.findItemByShape(shape)
+            self.labelList.selectItem(item)
+            self.labelList.scrollToItem(item)
+        self._noSelectionSlot = False
+        n_selected = len(selected_shapes)
+        self.actions.delete.setEnabled(n_selected)
+        self.actions.duplicate.setEnabled(n_selected)
+        self.actions.edit.setEnabled(n_selected == 1)
+
+    def toggleDrawingSensitive(self, drawing=True):
+        """Toggle drawing sensitive.
+
+        In the middle of drawing, toggling between modes should be disabled.
+        """
+        self.actions.editMode.setEnabled(not drawing)
+        # self.actions.undoLastPoint.setEnabled(drawing)
+        # self.actions.undo.setEnabled(not drawing)
+        # self.actions.delete.setEnabled(not drawing)
+    def setScroll(self, orientation, value):
+        self.scrollBars[orientation].setValue(int(value))
+        self.scroll_values[orientation][self.current_img] = value
+
+    def toolbar(self, title, actions=None):
+        toolbar = self.addToolBar("%sToolBar" % title)
+        # toolbar.setOrientation(Qt.Vertical)
+        if actions:
+            utils.addActions(toolbar, actions)
+        return toolbar
+
+    def setEditMode(self):
+        self.toggleDrawMode(True)
+
+    def toggleDrawMode(self, edit=True, createMode="polygon"):
+        self.canvas.setEditing(edit)
+        self.canvas.createMode = createMode
+        if edit:
+            self.actions.createMode.setEnabled(True)
+            self.actions.createPointMode.setEnabled(True)
+            self.actions.createRectangleMode.setEnabled(True)
+
+        else:
+            if createMode == "polygon":
+                self.actions.createPointMode.setEnabled(True)
+                self.actions.createMode.setEnabled(False)
+                self.actions.createRectangleMode.setEnabled(True)
+
+            elif createMode == "point":
+                self.actions.createMode.setEnabled(True)
+                self.actions.createPointMode.setEnabled(False)
+                self.actions.createRectangleMode.setEnabled(True)
+            elif createMode == "rectangle":
+                self.actions.createMode.setEnabled(True)
+                self.actions.createPointMode.setEnabled(True)
+                self.actions.createRectangleMode.setEnabled(False)
+            else:
+                raise ValueError("Unsupported createMode: %s" % createMode)
+        self.actions.editMode.setEnabled(not edit)
+
+    def validateLabel(self, label):
+        return True
+
+    def labelSelectionChanged(self):
+        if self._noSelectionSlot:
+            return
+        if self.canvas.editing():
+            selected_shapes = []
+            for item in self.labelList.selectedItems():
+                selected_shapes.append(item.shape())
+            if selected_shapes:
+                self.canvas.selectShapes(selected_shapes)
+            else:
+                self.canvas.deSelectShape()
+
+    def iou(self, target_mask, mask_list):
+        target_mask = target_mask.reshape(1,-1)
+        mask_list = mask_list.reshape(mask_list.shape[0], -1)
+        i = (target_mask * mask_list)
+        u = target_mask + mask_list - i
+        return i.sum(1)/u.sum(1)
+
+
+    def polygon2mask(self,polygon, size):
+        mask = np.zeros((size)) # h,w
+        contours = np.array(polygon)
+        mask = cv2.fillPoly(mask, [contours.astype(np.int32)],1)
+        return mask.astype(np.uint8)
+
+    def mask2polygon(self, mask):
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours = np.array(contours[0])
+        return contours
+
+    def editLabel(self, item=None):
+        if item and not isinstance(item, LabelListWidgetItem):
+            raise TypeError("item must be LabelListWidgetItem type")
+
+        if not self.canvas.editing():
+            return
+        if not item:
+            item = self.currentItem()
+        if item is None:
+            return
+        shape = item.shape()
+        if shape is None:
+            return
+        xx = self.labelDialog.popUp(
+            text=shape.label,
+            flags=shape.flags,
+            group_id=shape.group_id,
+        )
+        if len(xx) == 4:
+            text, flags, group_id,_ = xx
+        else:
+            text, flags, group_id = xx
+        if text is None:
+            return
+        if not self.validateLabel(text):
+            self.errorMessage(
+                self.tr("Invalid label"),
+                self.tr("Invalid label '{}' with validation type '{}'").format(
+                    text, self._config["validate_label"]
+                ),
+            )
+            return
+        shape.label = text
+        shape.flags = flags
+        shape.group_id = group_id
+
+        self._update_shape_color(shape)
+        if shape.group_id is None:
+            item.setText(
+                '{} <font color="#{:02x}{:02x}{:02x}">●</font>'.format(
+                    html.escape(shape.label), *shape.fill_color.getRgb()[:3]
+                )
+            )
+        else:
+            item.setText("({}) {}".format(shape.group_id, shape.label))
+        self.setDirty()
+        if self.uniqLabelList.findItemByLabel(shape.label) is None:
+            item = self.uniqLabelList.createItemFromLabel(shape.label)
+            self.uniqLabelList.addItem(item)
+            # rgb = self._get_rgb_by_label(shape.label)
+            rgb = self._get_rgb_by_label(shape.group_id)
+            self.uniqLabelList.setItemLabel(item, shape.label, rgb)
+
+    def labelItemChanged(self, item):
+        shape = item.shape()
+        self.canvas.setShapeVisible(shape, item.checkState() == Qt.Checked)
+
+    def labelOrderChanged(self):
+        self.setDirty()
+        self.canvas.loadShapes([item.shape() for item in self.labelList])
+
+    def addLabel(self, shape):
+        if shape.group_id is None:
+            text = shape.label
+        else:
+            text = "({}) {}".format(shape.group_id, shape.label)
+        label_list_item = LabelListWidgetItem(text, shape)
+        self.labelList.addItem(label_list_item)
+        if self.uniqLabelList.findItemByLabel(shape.label) is None:
+            item = self.uniqLabelList.createItemFromLabel(shape.label)
+            self.uniqLabelList.addItem(item)
+            # rgb = self._get_rgb_by_label(shape.label)
+            rgb = self._get_rgb_by_label(shape.group_id)
+            self.uniqLabelList.setItemLabel(item, shape.label, rgb)
+        self.labelDialog.addLabelHistory(shape.label)
+        for action in self.actions.onShapesPresent:
+            action.setEnabled(True)
+
+        self._update_shape_color(shape)
+        label_list_item.setText(
+            '{} <font color="#{:02x}{:02x}{:02x}">●</font>'.format(
+                html.escape(text), *shape.fill_color.getRgb()[:3]
+            )
+        )
+
+    def _get_rgb_by_label(self, label):
+        label = str(label)
+        item = self.uniqLabelList.findItemByLabel(label)
+        if item is None:
+            item = self.uniqLabelList.createItemFromLabel(label)
+            self.uniqLabelList.addItem(item)
+            rgb = self._get_rgb_by_label(label)
+            self.uniqLabelList.setItemLabel(item, label, rgb)
+        label_id = self.uniqLabelList.indexFromItem(item).row() + 1
+        label_id += 0
+        return LABEL_COLORMAP[label_id % len(LABEL_COLORMAP)]
+
+    def togglePolygons(self, value):
+        for item in self.labelList:
+            item.setCheckState(Qt.Checked if value else Qt.Unchecked)
+
+    def _update_shape_color(self, shape):
+        # r, g, b = self._get_rgb_by_label(shape.label)
+        r, g, b = self._get_rgb_by_label(shape.group_id)
+        shape.line_color = QtGui.QColor(r, g, b)
+        shape.vertex_fill_color = QtGui.QColor(r, g, b)
+        shape.hvertex_fill_color = QtGui.QColor(255, 255, 255)
+        shape.fill_color = QtGui.QColor(r, g, b, 128)
+        shape.select_line_color = QtGui.QColor(255, 255, 255)
+        shape.select_fill_color = QtGui.QColor(r, g, b, 155)
+
+    def undoShapeEdit(self):
+        self.canvas.restoreShape()
+        self.labelList.clear()
+        self.loadShapes(self.canvas.shapes)
+        self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
+
+    def loadShapes(self, shapes, replace=True):
+        self._noSelectionSlot = True
+        for shape in shapes:
+            self.addLabel(shape)
+        self.labelList.clearSelection()
+        self._noSelectionSlot = False
+        self.canvas.loadShapes(shapes, replace=replace)
+
+
+    def moveShape(self):
+        self.canvas.endMove(copy=False)
+        self.setDirty()
+
+    def copyShape(self):
+        self.canvas.endMove(copy=True)
+        for shape in self.canvas.selectedShapes:
+            self.addLabel(shape)
+        self.labelList.clearSelection()
+        self.setDirty()
+    def deleteSelectedShape(self):
+        #yes, no = QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No
+        #msg = self.tr(
+        #    "You are about to permanently delete {} polygons, "
+        #    "proceed anyway?"
+        #).format(len(self.canvas.selectedShapes))
+        #if yes == QtWidgets.QMessageBox.warning(
+        #    self, self.tr("Attention"), msg, yes | no, yes
+        #):
+        self.remLabels(self.canvas.deleteSelected())
+        self.setDirty()
+        if self.noShapes():
+            for action in self.actions.onShapesPresent:
+                action.setEnabled(False)
+    def duplicateSelectedShape(self):
+        added_shapes = self.canvas.duplicateSelectedShapes()
+        self.labelList.clearSelection()
+        for shape in added_shapes:
+            self.addLabel(shape)
+        self.setDirty()
+
+    def reducePoint(self):
+        def format_shape(s):
+            data = s.other_data.copy()
+            data.update(
+                dict(
+                    label=s.label.encode("utf-8") if PY2 else s.label,
+                    points=[(p.x(), p.y()) for p in s.points],
+                    group_id=s.group_id,
+                    shape_type=s.shape_type,
+                    flags=s.flags,
+                )
+            )
+            return data
+        shapes = self.current_img
+        shapes = [format_shape(item.shape()) for item in self.labelList.selectedItems()]
+        rm_shapes = [item.shape() for item in self.labelList.selectedItems()]
+        self.remLabels(rm_shapes)
+        for shape in shapes:
+            points = shape['points']
+            min_dis = self.get_min_dis(points)
+            points_new = [points[0]]
+            for i in range(1,len(points)):
+                d = math.sqrt((points[i][0] - points_new[-1][0]) ** 2 + (points[i][1] - points_new[-1][1]) ** 2)
+                if d > (min_dis * 1.5):
+                    points_new.append(points[i])
+            shape['points'] = points_new
+        #self.labelList.clear()
+        for tmp_shape in shapes:
+            shape = Shape(
+                label=tmp_shape['label'],
+                shape_type=tmp_shape['shape_type'],
+                group_id=tmp_shape['group_id'],
+            )
+            for point_index in range(len(tmp_shape['points'])):
+                shape.addPoint(QtCore.QPointF(tmp_shape['points'][point_index][0], tmp_shape['points'][point_index][1]))
+            shape.close()
+            self.addLabel(shape)
+            tmp_item = self.labelList.findItemByShape(shape)
+            self.labelList.selectItem(tmp_item)
+            self.labelList.scrollToItem(tmp_item)
+        self.canvas.loadShapes([item.shape() for item in self.labelList])
+        self.actions.save.setEnabled(True)
+
+    def get_min_dis(self, points):
+        min_dis = 10000
+        if len(points) >= 2:
+            points_new = [points[0]]
+            for i in range(1,len(points)):
+                d = math.sqrt((points[i][0] - points_new[-1][0]) ** 2 + (points[i][1] - points_new[-1][1]) ** 2)
+                min_dis = min(min_dis, d)
+                points_new.append(points[i])
+        return min_dis
+
+
+
+    def pasteSelectedShape(self):
+        self.loadShapes(self._copied_shapes, replace=False)
+        self.setDirty()
+
+    def copySelectedShape(self):
+        self._copied_shapes = [s.copy() for s in self.canvas.selectedShapes]
+        self.actions.paste.setEnabled(len(self._copied_shapes) > 0)
+
+    def currentItem(self):
+        items = self.labelList.selectedItems()
+        if items:
+            return items[0]
+        return None
+
+    def remLabels(self, shapes):
+        for shape in shapes:
+            item = self.labelList.findItemByShape(shape)
+            self.labelList.removeItem(item)
+
+
+    def noShapes(self):
+        return not len(self.labelList)
+
+    def addZoom(self, increment=1.1):
+        zoom_value = self.zoomWidget.value() * increment
+        if increment > 1:
+            zoom_value = math.ceil(zoom_value)
+        else:
+            zoom_value = math.floor(zoom_value)
+        self.setZoom(zoom_value)
+
+    def setZoom(self, value):
+        self.zoomMode = self.MANUAL_ZOOM
+        self.zoomWidget.setValue(value)
+        self.zoom_values[self.current_img] = (self.zoomMode, value)
+
+    def paintCanvas(self):
+        self.canvas.scale = 0.01 * self.zoomWidget.value()
+        self.canvas.adjustSize()
+        self.canvas.update()
+
+    def clickGroupSeg(self):
+        # 現在のマスクを取得
+        # if not self.sam_mask_proposal:
+        #     QMessageBox.warning(self, self.tr("Warning"), self.tr("No segments available for grouping."))
+        #     return
+
+        # ユーザーが選択したセグメントを取得
+        selected_segments = self.canvas.selectedShapes  # 選択されたセグメントを取得
+        ic(selected_segments)
+        if not selected_segments:
+            QMessageBox.warning(self, self.tr("Warning"), self.tr("No segments selected. Please select segments to group."))
+            return
+        
+        # グループ分けのためのラベルを取得
+        # label = self.default_label if self.default_label else 'Object'
+        label = "secondary"
+
+        # 選択されたセグメントをグループ分け
+        for segment in selected_segments:
+            segment.label = label
+            segment.group_id = self.group_id
+            # self.addLabel(segment)  # ラベルを追加
+            self.grouped_segments.append(segment)  # グループ分けされたセグメントを保持
+
+        self.group_id += 1
+        self.grouping_complete = True  # グループ分け完了
+        self.canvas.currentBox = None
+        self.canvas.currentPos = None
+        self.canvas.currentNeg = None
+        self.sam_mask_proposal = []  # プロポーザルをクリア
+        self.show_proposals()  # プロポーザルを表示
+        self.canvas.loadShapes([item.shape() for item in self.labelList])  # シェイプを再読み込み
+        self.actions.save.setEnabled(True)  # 保存ボタンを有効化
+        self.actions.editMode.setEnabled(True)  # 編集モードを有効化
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(description="pixel annotator by GroundedSAM")
+    parser.add_argument(
+        "--app_resolution",
+        default='1000,1600',
+    )
+    parser.add_argument(
+        "--model_type",
+        default='vit_b',
+    )
+    parser.add_argument(
+        "--keep_input_size",
+        type=bool,
+        default=True,
+    )   
+    parser.add_argument(
+        "--max_size",
+        default=720,
+    )
+    parser.add_argument(
+        "--category_file",
+        default=None,
+    )   
+    return parser
+
+if __name__ == '__main__':
+    parser = get_parser()
+    global_h, global_w = [int(i) for i in parser.parse_args().app_resolution.split(',')]
+    model_type = parser.parse_args().model_type
+    keep_input_size = parser.parse_args().keep_input_size
+    max_size = parser.parse_args().max_size
+    category_file = parser.parse_args().category_file
+    app = QApplication(sys.argv)
+    main = MainWindow(global_h=global_h, global_w=global_w, model_type=model_type, keep_input_size=keep_input_size, max_size=max_size, category_file=category_file)
+    main.show()
+    sys.exit(app.exec_())

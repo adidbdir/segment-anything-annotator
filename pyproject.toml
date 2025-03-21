@@ -62,6 +62,8 @@ dependencies = [
     "zipp==3.15.0",
     "opencv-python-headless>=4.8.1.78",
     "opencv-python==4.7.0.72",
+    "icecream>=2.1.4",
+    "pandas>=2.1.0",
 ]
 
 [tool.uv.sources]
