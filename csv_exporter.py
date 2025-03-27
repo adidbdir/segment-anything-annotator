@@ -1,5 +1,7 @@
 import os
 import csv
+from datetime import datetime
+from pathlib import Path
 
 def construct_csv_filename(experiment_params):
     """
@@ -21,30 +23,97 @@ def construct_csv_filename(experiment_params):
     filename = f"{exp}_{date}_{impurity_type},{impurity_conc}_{seed_size}_{crystallization_time}_{suspension_density}_{image_scaler}.csv"
     return filename
 
-def export_csv(results, experiment_params, output_folder):
+def get_max_particle_id_from_csv(filepath):
     """
-    解析結果を CSV として output_folder 内に出力する。
+    CSVファイルから最大の一次粒子IDを取得する
     
-    Parameters:
-      results: dict のリスト。各 dict は少なくとも以下のキーを持つことが想定される。
-               "mask_index", "area", "obb_width", "obb_height", "obb_angle"
-      experiment_params: dict
-         以下のキーを想定：
-         "experimenter", "date", "impurity_type", "impurity_concentration",
-         "seed_size", "crystallization_time", "suspension_density", "image_scaler"
-      output_folder: CSV ファイルを保存するフォルダ（存在しない場合は作成）
-      
+    Args:
+        filepath (str or Path): CSVファイルのパス
+    
     Returns:
-      CSV ファイルのフルパスを返す。
+        int: 最大の一次粒子ID（ファイルが存在しない場合や読み取れない場合は0）
     """
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-    filename = construct_csv_filename(experiment_params)
-    csv_path = os.path.join(output_folder, filename)
+    filepath = Path(filepath)
+    if not filepath.exists():
+        return 0
     
-    fieldnames =  ["image_filename", "particle_id", "secondary_components", "particle_type", "Lmajor [um]", "Lminor [um]"]
-    with open(csv_path, mode="w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(results)
-    return csv_path
+    max_id = 0
+    try:
+        with filepath.open('r', newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                # 一次粒子IDカラムの値を取得
+                particle_id_str = row.get('一次粒子ID', '')
+                
+                # 二次粒子の場合はカンマ区切りの値を含むため、スキップ
+                if ',' in str(particle_id_str):
+                    continue
+                    
+                try:
+                    particle_id = int(particle_id_str)
+                    max_id = max(max_id, particle_id)
+                except (ValueError, TypeError):
+                    # 数値変換できない場合は無視
+                    pass
+    except Exception as e:
+        print(f"エラー: CSVファイルの読み込み中に問題が発生しました - {e}")
+    
+    return max_id
+
+def export_csv(results, experiment_params, output_dir):
+    """
+    パーティクル解析結果をCSVファイルにエクスポートする関数
+    追記モードをサポート：既存ファイルがあれば追記、なければ新規作成
+    
+    Args:
+        results (list): 解析結果のリスト。各要素は辞書形式でフィールド名と値を持つ
+        experiment_params (dict): 実験パラメータ情報の辞書
+        output_dir (str): 出力ディレクトリのパス
+    """
+    
+    filename = construct_csv_filename(experiment_params)
+    output_path = Path(output_dir)
+    filepath = output_path / filename
+    
+    # ヘッダーフィールドの定義 - ふるい_500_,____.csv に合わせる
+    fieldnames = [
+        '画像ファイル名', '一次粒子ID', '二次粒子ID', '粒子形態', 
+        'Lmajor[um]', 'Lminor[um]', 'L[um]', 'Lmean[um]', 
+        'n', 'Agg.', 'Area[um^2]'
+    ]
+    
+    # 結果データの変換とフィールド名マッピング
+    mapped_results = []
+    for result in results:
+        mapped_result = {
+            '画像ファイル名': result.get('image_filename', ''),
+            '一次粒子ID': result.get('particle_id', ''),
+            '二次粒子ID': result.get('secondary_id', ''),
+            '粒子形態': result.get('particle_type', ''),
+            'Lmajor[um]': result.get('Lmajor [um]', ''),
+            'Lminor[um]': result.get('Lminor [um]', ''),
+            'L[um]': result.get('L[um]', ''),
+            'Lmean[um]': result.get('Lmean[um]', ''),
+            'n': result.get('n', ''),
+            'Agg.': result.get('Agg.', ''),
+            'Area[um^2]': result.get('Area[um^2]', '')
+        }
+        mapped_results.append(mapped_result)
+    
+    # ファイルが存在するかチェック
+    file_exists = filepath.exists()
+    
+    # CSVファイルへの書き込み（追記または新規作成）
+    mode = 'a' if file_exists else 'w'
+    with filepath.open(mode, newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        # 新規ファイルの場合のみヘッダーを書き込み
+        if not file_exists:
+            writer.writeheader()
+        
+        # データ行の書き込み
+        writer.writerows(mapped_results)
+    
+    # print(f"CSV data {'appended to' if file_exists else 'exported to'}: {filepath}")
+    return str(filepath)
