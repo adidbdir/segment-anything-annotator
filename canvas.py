@@ -9,7 +9,10 @@ from collections import namedtuple
 import cv2
 import numpy as np
 import torch
+import imgviz
 
+# LABEL_COLORMAPの定義を追加
+LABEL_COLORMAP = imgviz.label_colormap()
 
 # TODO(unknown):
 # - [maybe] Find optimal epsilon value.
@@ -1207,6 +1210,116 @@ class Canvas(QtWidgets.QWidget):
         self.pixmap = None
         self.shapesBackups = []
         self.update()
+
+    def renderToPixmap(self, width=None, height=None, fillColor=None, hideBackground=True):
+        """
+        Render current canvas contents to a QPixmap
+        
+        Args:
+            width (int): Width of output pixmap, defaults to current pixmap width
+            height (int): Height of output pixmap, defaults to current pixmap height
+            fillColor (QColor): Background color for the rendered image
+            hideBackground (bool): If True, hide non-selected shapes
+            
+        Returns:
+            QPixmap: Rendered pixmap of annotations
+        """
+        if not width:
+            width = self.pixmap.width()
+        if not height:
+            height = self.pixmap.height()
+        
+        # Create a new pixmap
+        pixmap = QtGui.QPixmap(width, height)
+        
+        if fillColor:
+            pixmap.fill(fillColor)
+        else:
+            pixmap.fill(QtCore.Qt.transparent)
+        
+        # Set up painter
+        painter = QtGui.QPainter()
+        painter.begin(pixmap)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        
+        # Apply same transformations as in paintEvent
+        painter.scale(1.0, 1.0)  # Scale to original size, not the zoomed view
+        
+        # Temporarily store current state
+        original_hiding = self._hideBackround
+        
+        # Set hiding state for rendering
+        if hideBackground:
+            self._hideBackround = hideBackground
+        
+        # Draw shapes
+        for shape in self.shapes:
+            # For mask rendering, use solid fill
+            shape_fill = shape.fill
+            shape.fill = True
+            
+            # Save current colors
+            original_fill_color = shape.fill_color
+            original_line_color = shape.line_color
+            
+            # Use group ID to determine color or solid white for binary mask
+            if fillColor:
+                # For binary mask, fill with white
+                shape.fill_color = QtGui.QColor(255, 255, 255, 255)
+                shape.line_color = QtGui.QColor(255, 255, 255, 255)
+            else:
+                # For colored mask, use group ID based color
+                group_id = shape.group_id if shape.group_id is not None else 1
+                r, g, b = LABEL_COLORMAP[group_id % len(LABEL_COLORMAP)]
+                shape.fill_color = QtGui.QColor(r, g, b, 255)
+                shape.line_color = QtGui.QColor(r, g, b, 255)
+            
+            # Draw shape
+            shape.paint(painter)
+            
+            # Restore original properties
+            shape.fill = shape_fill
+            shape.fill_color = original_fill_color
+            shape.line_color = original_line_color
+        
+        # Restore original hiding state
+        self._hideBackround = original_hiding
+        
+        painter.end()
+        return pixmap
+
+    def renderToBinaryMask(self):
+        """
+        Render current canvas contents to a binary mask numpy array
+        
+        Returns:
+            np.ndarray: Binary mask where each pixel value is the shape group_id
+        """
+        # Render to a QPixmap with white fill for shapes
+        pixmap = self.renderToPixmap(fillColor=QtGui.QColor(0, 0, 0, 255))
+        
+        # Convert QPixmap to QImage
+        image = pixmap.toImage()
+        
+        # Convert QImage to numpy array
+        width = image.width()
+        height = image.height()
+        
+        # Create numpy array for mask (initialized with zeros)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        
+        # Fill mask with group IDs
+        for shape in self.shapes:
+            group_id = shape.group_id if shape.group_id is not None else 1
+            
+            # Convert shape to polygon points
+            points = np.array([[p.x(), p.y()] for p in shape.points], dtype=np.int32)
+            
+            # Fill polygon with group_id
+            cv2.fillPoly(mask, [points], group_id)
+        
+        return mask
 
             
 
