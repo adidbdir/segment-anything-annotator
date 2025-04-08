@@ -54,7 +54,7 @@ class MainWindow(QMainWindow):
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = 0, 1, 2
 
     def __init__(self, parent=None, global_w=1000, global_h=1800, model_type='vit_b', keep_input_size=True, max_size=1080, category_file='primary.txt',
-                 save_mask=False, save_bbox=False):
+                 save_mask=True, save_bbox=True, save_labels=True, image_directory=None):
         super(MainWindow, self).__init__(parent)
         self.resize(global_w, global_h)
         self.model_type = model_type
@@ -221,6 +221,7 @@ class MainWindow(QMainWindow):
         self.image_scaler_edit = QtWidgets.QLineEdit()
         
         self.zoomWidget = ZoomWidget()
+        self.image_directory = image_directory
 
         action = functools.partial(utils.newAction, self)
         
@@ -533,6 +534,7 @@ class MainWindow(QMainWindow):
         # 保存設定の保持
         self.save_mask = save_mask
         self.save_bbox = save_bbox
+        self.save_labels = save_labels
         
         # 保存設定用チェックボックス
         self.save_mask_checkbox = QtWidgets.QCheckBox(self.tr("Save Mask Images"), self)
@@ -566,15 +568,17 @@ class MainWindow(QMainWindow):
         self._saveFile(self.current_output_filename)
 
     def _saveFile(self, filename):
-        if filename and self.saveLabels(filename):
-            # マスクとバウンディングボックス画像の保存
-            if self.save_mask or self.save_bbox:
-                filename_base = os.path.splitext(filename)[
-                    0
-                ]  # 拡張子を除いたファイル名
-                self.saveMaskAndBBoxImages(filename_base)
+        
+        if self.save_labels:
+            self.saveLabels(filename)
+        # マスクとバウンディングボックス画像の保存
+        if self.save_mask or self.save_bbox:
+            filename_base = os.path.splitext(filename)[
+                0
+            ]  # 拡張子を除いたファイル名
+            self.saveMaskAndBBoxImages(filename_base)
 
-            self.setClean()
+        self.setClean()
 
     # def saveFileAs(self, _value=False):
     #     assert not self.image.isNull(), "cannot save empty image"
@@ -809,7 +813,10 @@ class MainWindow(QMainWindow):
         self.paintCanvas()
 
     def clickFileChoose(self):
-        directory = QFileDialog.getExistingDirectory(self, 'choose target fold','.')
+        if self.image_directory is not None:
+            directory = self.image_directory
+        else:
+            directory = QFileDialog.getExistingDirectory(self, 'choose target fold','.')
         if directory == '':
             return
         #self.img_list = glob.glob(directory + '/*.{jpg,png,JPG,PNG}')
@@ -1585,7 +1592,7 @@ class MainWindow(QMainWindow):
 
     def clickGroupSeg(self):
         # ユーザーが選択したセグメントを取得
-        selected_segments = self.canvas.selectedShapes  # 選択されたセグメントを取得
+        selected_segments = self.canvas.selectedShapes
         
         if not selected_segments:
             QMessageBox.warning(self, self.tr("Warning"), self.tr("No segments selected. Please select segments to group."))
@@ -1594,29 +1601,79 @@ class MainWindow(QMainWindow):
         # 現在のグループIDを保存（CSVエクスポート用）
         current_group_id = self.group_id
         
-        # 選択されたセグメント（一次粒子）をグループ化する（ラベルは変更せず、group_idのみ設定）
+        # 選択されたセグメント（一次粒子）のIDを収集
         primary_ids = []
+        segment_ids = []
+        
+        # 1. プライマリーのBBのxxyyのリストを作成する
+        # バウンディングボックスの最小値と最大値を初期化
+        min_x = float('inf')
+        min_y = float('inf')
+        max_x = float('-inf')
+        max_y = float('-inf')
+        
         for segment in selected_segments:
-            # 元のグループIDを保存
-            orig_group_id = segment.group_id
-            
-            # グループIDのみを更新（ラベルは変更しない）
-            segment.group_id = self.group_id
-            
-            # 一次粒子IDを記録
+            # 一次粒子IDを記録 - IDを変更せずに保持
             particle_id = getattr(segment, 'particle_id', None)
             if particle_id is not None:
                 primary_ids.append(particle_id)
             
-            # LabelListWidgetItemを更新（ラベルを保持したままグループIDを表示）
-            item = self.labelList.findItemByShape(segment)
-            if item:
-                item.setText(f"({self.group_id}) {segment.label}")
+            # セグメントのIDを記録（IDがなければグループIDを使用）
+            seg_id = getattr(segment, 'id', None) or segment.group_id
+            if seg_id is not None:
+                segment_ids.append(str(seg_id))
             
             # グループ分けされたセグメントを保持
             self.grouped_segments.append(segment)
             
-            # ic(f"Updated segment: group_id {orig_group_id} -> {self.group_id}, kept label: {segment.label}")
+            # 重要: セグメント自体のgroup_idは変更しない
+            # 代わりに、セグメントに関連付けられたセカンダリーグループIDを記録
+            setattr(segment, 'secondary_group_id', current_group_id)
+            
+            # セグメントのバウンディングボックスを取得し、全体のバウンディングボックスを更新
+            points = segment.points
+            for point in points:
+                min_x = min(min_x, point.x())
+                min_y = min(min_y, point.y())
+                max_x = max(max_x, point.x())
+                max_y = max(max_y, point.y())
+        
+        # 2. リスト中xとyの最大最小をそれぞれ取得 (上記で既に計算済み)
+        
+        # 3. xxyyをxywhに書き直してsecondaryのBBとする
+        # Secondaryグループを表すShapeオブジェクトを作成
+        secondary_shape = Shape(
+            label=f"secondary",  # ラベルを設定
+            shape_type="rectangle",  # "rectangle"を使用
+            group_id=current_group_id,  # セカンダリーグループIDを設定
+        )
+        
+        # 関連付けられたプライマリーセグメントIDを記録
+        setattr(secondary_shape, 'primary_segment_ids', segment_ids)
+        
+        # Rectangle型の場合は左上と右下の2点だけを追加
+        secondary_shape.addPoint(QtCore.QPointF(min_x, min_y))  # 左上
+        secondary_shape.addPoint(QtCore.QPointF(max_x, max_y))  # 右下
+        secondary_shape.close()
+        
+        # バウンディングボックスの見た目を設定
+        # 線の色を設定（グループIDに基づく色）
+        r, g, b = self._get_rgb_by_label(current_group_id)
+        secondary_shape.line_color = QtGui.QColor(r, g, b, 200)  # 少し透明に
+        secondary_shape.vertex_fill_color = QtGui.QColor(r, g, b, 120)
+        secondary_shape.fill_color = QtGui.QColor(r, g, b, 30)  # 非常に透明な塗りつぶし
+        
+        # セカンダリーグループをラベルリストに追加
+        self.addLabel(secondary_shape)
+        item = self.labelList.findItemByShape(secondary_shape)
+        if item:
+            # 追加したアイテムが見つかったら、それを選択して表示
+            self.labelList.selectItem(item)
+            self.labelList.scrollToItem(item)
+            
+            # ラベルテキストを更新して選択されたセグメントIDを表示
+            ids_text = ", ".join(segment_ids) if segment_ids else "none"
+            item.setText(f"secondary (contains: {ids_text})")
         
         # グループIDをインクリメント
         self.group_id += 1
@@ -1629,10 +1686,10 @@ class MainWindow(QMainWindow):
         self.sam_mask_proposal = []  # プロポーザルをクリア
         
         # UI を更新
-        self.show_proposals()  # プロポーザルを表示
+        self.show_proposals()
         self.canvas.loadShapes([item.shape() for item in self.labelList])  # シェイプを再読み込み
         
-        # 選択されたセグメントをCSVにエクスポート
+        # 選択されたセグメントをCSVにエクスポート - 元のIDを保持したままエクスポート
         self.exportSelectedSegmentsToCSV(selected_segments, current_group_id)
         
         # ボタン状態を更新
@@ -2108,35 +2165,44 @@ class MainWindow(QMainWindow):
 
         # マスク画像の作成と保存
         if self.save_mask:
-            # Canvas から直接バイナリマスクを取得
-            mask_img = self.canvas.renderToBinaryMask()
+            # canvas上の状態をそのままQPixmapにレンダリング
+            width = self.canvas.pixmap.width()
+            height = self.canvas.pixmap.height()
+            output_pixmap = self.canvas.renderToPixmap(width=width, height=height)
             
-            # マスク画像の保存
-            mask_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_mask.png")
-            cv2.imwrite(mask_filename, mask_img)
+            # QPixmapをQImageに変換
+            qimage = output_pixmap.toImage()
             
-            # カラーマスクの作成（任意）
-            color_mask_pixmap = self.canvas.renderToPixmap()
-            color_mask_image = color_mask_pixmap.toImage()
+            # QImageをNumPy配列に変換
+            ptr = qimage.bits()
+            ptr.setsize(qimage.byteCount())
+            arr = np.array(ptr).reshape(height, width, 4)  # 4は、RGBAのバイト数
             
-            # QImage を NumPy 配列に変換
-            width = color_mask_image.width()
-            height = color_mask_image.height()
-            ptr = color_mask_image.bits()
-            ptr.setsize(height * width * 4)  # 4 bytes per pixel (RGBA)
-            color_mask_array = np.frombuffer(ptr, np.uint8).reshape((height, width, 4))
+            # 元の画像を読み込んでリサイズ
+            original_img = cv2.imread(self.current_img)
+            original_img = cv2.resize(original_img, (width, height))
             
-            # BGR 形式に変換（OpenCV 用）
-            color_mask_array_bgr = cv2.cvtColor(color_mask_array, cv2.COLOR_RGBA2BGR)
+            # マスク画像（透明部分を除く）と元の画像を合成
+            alpha = arr[:, :, 3] / 255.0
+            alpha = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)  # 3チャンネル分に複製
             
-            # カラーマスク画像の保存
-            color_mask_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_mask_color.png")
-            cv2.imwrite(color_mask_filename, color_mask_array_bgr)
+            # RGB順をBGR順に変換（cv2はBGR形式）
+            arr_bgr = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
+            
+            # 合成（マスクの不透明部分と元画像を混合）
+            composite_img = (arr_bgr * alpha + original_img * (1 - alpha)).astype(np.uint8)
+            
+            # # 純粋なマスク画像（塗りつぶし領域）も保存
+            # color_mask_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_mask_color.png")
+            # output_pixmap.save(color_mask_filename, "PNG")
+            
+            # 合成画像の保存
+            composite_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_composite.png")
+            cv2.imwrite(composite_filename, composite_img)
         
         # バウンディングボックス画像の作成
         if self.save_bbox:
-            
-                
+            # 以下は既存のコードと同じ
             bbox_img = img.copy()
             
             # 各形状のバウンディングボックスを描画
@@ -2172,33 +2238,51 @@ def get_parser():
     parser.add_argument(
         "--app_resolution",
         default='1000,1600',
+        help="Application window resolution in format 'height,width'"
     )
     parser.add_argument(
         "--model_type",
         default='vit_b',
+        help="Model type for SAM"
     )
     parser.add_argument(
         "--keep_input_size",
         type=bool,
         default=True,
+        help="Keep original input size"
     )   
     parser.add_argument(
         "--max_size",
         default=720,
+        help="Maximum size for image scaling"
     )
     parser.add_argument(
         "--category_file",
         default=None,
-    )   
+        help="Path to category file"
+    )
     parser.add_argument(
         "--save_mask",
         action="store_true",
-        help="Save segmentation mask images",
+        default=True,
+        help="Save segmentation mask images"
     )
     parser.add_argument(
         "--save_bbox",
         action="store_true",
-        help="Save bounding box visualization images",
+        default=True,
+        help="Save bounding box visualization images"
+    )
+    parser.add_argument(
+        "--save_labels",
+        action="store_false",
+        default=True,
+        help="Save annotation labels as JSON files"
+    )
+    parser.add_argument(
+        "--image_directory",
+        default=None,
+        help="Directory containing images to annotate"
     )
     return parser
 
@@ -2212,6 +2296,8 @@ if __name__ == '__main__':
     category_file = args.category_file
     save_mask = args.save_mask
     save_bbox = args.save_bbox
+    save_labels = args.save_labels
+    image_directory = args.image_directory
     
     app = QApplication(sys.argv)
     main = MainWindow(
@@ -2222,7 +2308,9 @@ if __name__ == '__main__':
         max_size=max_size, 
         category_file=category_file,
         save_mask=save_mask,
-        save_bbox=save_bbox
+        save_bbox=save_bbox,
+        save_labels=save_labels,
+        image_directory=image_directory
     )
     main.show()
     sys.exit(app.exec_())
