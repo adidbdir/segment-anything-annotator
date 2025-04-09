@@ -15,6 +15,7 @@ import tempfile
 import torch
 import base64
 import csv
+import uuid
 
 from PyQt5.QtWidgets import QWidget, QApplication, QMainWindow, QApplication, QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, QScrollArea, QDockWidget, QMessageBox, QLineEdit, QCheckBox
 from PyQt5.QtGui import QPixmap, QIcon, QImage
@@ -509,11 +510,11 @@ class MainWindow(QMainWindow):
 
         self.zoomWidget.valueChanged.connect(self.paintCanvas)
         self.canvas.actions = self.actions
-
+    
         # 初期化時にカテゴリファイルを読み込む
         # 一つのラベルしかない場合は自動的にそのラベルを設定
-            # acceptを押した際に自動でラベルが設定されるように
-            # SAMの読みこみを実行する
+        # acceptを押した際に自動でラベルが設定されるように
+        # SAMの読みこみを実行する
         # 複数の場合はNoneに設定   
         if self.category_file and os.path.exists(self.category_file):
             try:
@@ -527,7 +528,7 @@ class MainWindow(QMainWindow):
                         # print(f"カテゴリファイルを読み込みました: {self.category_file}")
                         self.clickLoadSAM()
                     else:
-                        self.default_label = None  # 複数の場合はNoneに設定
+                                self.default_label = None  # 複数の場合はNoneに設定
             except Exception as e:
                 print(f"カテゴリファイルの読み込みに失敗しました: {e}")
         
@@ -548,7 +549,7 @@ class MainWindow(QMainWindow):
         # チェックボックスの配置
         self.save_mask_checkbox.move(int(0.01 * global_w), int(0.95 * global_h))
         self.save_bbox_checkbox.move(int(0.20 * global_w), int(0.95 * global_h))
-
+    
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
         self._saveFile(self.saveFileDialog())
@@ -578,7 +579,7 @@ class MainWindow(QMainWindow):
             ]  # 拡張子を除いたファイル名
             self.saveMaskAndBBoxImages(filename_base)
 
-        self.setClean()
+            self.setClean()
 
     # def saveFileAs(self, _value=False):
     #     assert not self.image.isNull(), "cannot save empty image"
@@ -614,7 +615,7 @@ class MainWindow(QMainWindow):
         
     def updateSaveBBoxSetting(self, state):
         self.save_bbox = (state == Qt.Checked)
-        
+
     def saveLabels(self, filename):
         lf = LabelFile()
 
@@ -1474,19 +1475,89 @@ class MainWindow(QMainWindow):
         self.labelList.clearSelection()
         self.setDirty()
     def deleteSelectedShape(self):
-        #yes, no = QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No
-        #msg = self.tr(
-        #    "You are about to permanently delete {} polygons, "
-        #    "proceed anyway?"
-        #).format(len(self.canvas.selectedShapes))
-        #if yes == QtWidgets.QMessageBox.warning(
-        #    self, self.tr("Attention"), msg, yes | no, yes
-        #):
-        self.remLabels(self.canvas.deleteSelected())
+        """選択されたシェイプを削除し、関連するprimaryを元に戻す"""
+        # 選択されたシェイプが存在しない場合は何もしない
+        if not self.canvas.selectedShapes:
+            return
+        
+        # 削除前のデータ保存
+        shapes_to_delete = self.canvas.selectedShapes.copy()
+        
+        # まず、secondaryシェイプが含まれているか確認
+        for shape in shapes_to_delete:
+            if shape.label == "secondary":
+                try:
+                    # 関連するprimaryを元に戻す処理
+                    primary_ids = getattr(shape, 'primary_segment_ids', [])
+                    secondary_group_id = shape.group_id
+                    
+                    # primaryを元に戻してから削除
+                    self._restorePrimarySegments(primary_ids, secondary_group_id)
+                except Exception as e:
+                    print(f"Error restoring primaries: {e}")
+        
+        # 次に、すべてのシェイプを削除
+        for shape in shapes_to_delete:
+            # キャンバスからシェイプを削除
+            self.canvas.deleteShape(shape)
+            
+            # labelListからシェイプに関連するアイテムを見つけて削除
+            # 既存のremLabelsメソッドを使用
+            self.remLabels([shape])
+        
+        # 変更を記録して更新
         self.setDirty()
-        if self.noShapes():
-            for action in self.actions.onShapesPresent:
-                action.setEnabled(False)
+        self.canvas.update()
+
+    def _restorePrimarySegments(self, primary_ids, secondary_group_id):
+        """
+        primaryセグメントを元のマスク表示に戻す
+        
+        Args:
+            primary_ids: 復元するprimaryセグメントのID配列
+            secondary_group_id: 関連するsecondaryグループID
+        """
+        # デバッグ情報
+        print(f"Restoring primaries: {primary_ids} from secondary: {secondary_group_id}")
+        
+        # 復元されたシェイプを追跡
+        restored = False
+        
+        for shape in self.canvas.shapes:
+            # すべての可能なID属性をチェック
+            shape_id = None
+            for id_attr in ['id', 'group_id', 'particle_id']:
+                if hasattr(shape, id_attr):
+                    shape_id = getattr(shape, id_attr)
+                    if shape_id and str(shape_id) in primary_ids:
+                        break
+            
+            # 対象のIDを持つプライマリーセグメントを探す
+            if shape_id and str(shape_id) in primary_ids:
+                print(f"Found primary to restore: {shape_id}")
+                # セカンダリーグループIDが一致するか確認
+                if hasattr(shape, 'secondary_group_id') and shape.secondary_group_id == secondary_group_id:
+                    print(f"Restoring shape with ID: {shape_id}")
+                    
+                    # 元のポイントと形状を復元
+                    if hasattr(shape, 'original_points'):
+                        # ポイントを復元
+                        shape.points = shape.original_points.copy()
+                        shape.shape_type = getattr(shape, 'original_shape_type', "polygon")
+                        setattr(shape, 'is_mask_visible', True)  # マスク表示をON
+                        
+                        # secondary_group_id属性をクリア
+                        if hasattr(shape, 'secondary_group_id'):
+                            delattr(shape, 'secondary_group_id')
+                        
+                        # 見た目を更新
+                        self._update_shape_color(shape)
+                        restored = True
+        
+        # キャンバス全体を更新（labelListの操作は行わない）
+        if restored:
+            self.canvas.update()
+
     def duplicateSelectedShape(self):
         added_shapes = self.canvas.duplicateSelectedShapes()
         self.labelList.clearSelection()
@@ -1590,22 +1661,24 @@ class MainWindow(QMainWindow):
         self.canvas.adjustSize()
         self.canvas.update()
 
-    def clickGroupSeg(self):
-        # ユーザーが選択したセグメントを取得
-        selected_segments = self.canvas.selectedShapes
+    def _processSelectedSegments(self, selected_segments, current_group_id):
+        """
+        選択されたセグメントを処理し、グループ化と境界ボックスの計算を行う
         
-        if not selected_segments:
-            QMessageBox.warning(self, self.tr("Warning"), self.tr("No segments selected. Please select segments to group."))
-            return
+        Args:
+            selected_segments: 処理対象のセグメントリスト
+            current_group_id: 新しいグループID
         
-        # 現在のグループIDを保存（CSVエクスポート用）
-        current_group_id = self.group_id
-        
-        # 選択されたセグメント（一次粒子）のIDを収集
+        Returns:
+            box: バウンディングボックス座標 [min_x, min_y, max_x, max_y]
+            all_points: すべてのセグメントの点のリスト
+            primary_ids: プライマリー粒子IDのリスト
+            segment_ids: セグメントIDのリスト
+        """
         primary_ids = []
         segment_ids = []
+        all_points = []
         
-        # 1. プライマリーのBBのxxyyのリストを作成する
         # バウンディングボックスの最小値と最大値を初期化
         min_x = float('inf')
         min_y = float('inf')
@@ -1618,83 +1691,196 @@ class MainWindow(QMainWindow):
             if particle_id is not None:
                 primary_ids.append(particle_id)
             
-            # セグメントのIDを記録（IDがなければグループIDを使用）
-            seg_id = getattr(segment, 'id', None) or segment.group_id
+            # セグメントのIDを記録
+            seg_id = getattr(segment, 'id', None) or getattr(segment, 'group_id', None)
             if seg_id is not None:
                 segment_ids.append(str(seg_id))
             
             # グループ分けされたセグメントを保持
-            self.grouped_segments.append(segment)
+            if hasattr(self, 'grouped_segments'):
+                self.grouped_segments.append(segment)
             
-            # 重要: セグメント自体のgroup_idは変更しない
-            # 代わりに、セグメントに関連付けられたセカンダリーグループIDを記録
-            setattr(segment, 'secondary_group_id', current_group_id)
-            
-            # セグメントのバウンディングボックスを取得し、全体のバウンディングボックスを更新
+            # セグメントのポイントを集め、境界ボックスを更新
             points = segment.points
             for point in points:
-                min_x = min(min_x, point.x())
-                min_y = min(min_y, point.y())
-                max_x = max(max_x, point.x())
-                max_y = max(max_y, point.y())
+                px, py = point.x(), point.y()
+                all_points.append((px, py))
+                min_x = min(min_x, px)
+                min_y = min(min_y, py)
+                max_x = max(max_x, px)
+                max_y = max(max_y, py)
         
-        # 2. リスト中xとyの最大最小をそれぞれ取得 (上記で既に計算済み)
+        # 境界ボックスと関連情報を返す
+        box = np.array([min_x, min_y, max_x, max_y])
+        return box, all_points, primary_ids, segment_ids
+
+    def clickGroupSeg(self):
+        # 選択されたセグメントの処理
+        selected_segments = self.canvas.selectedShapes
+        if not selected_segments:
+            QMessageBox.warning(self, "警告", "グループ化するセグメントを選択してください")
+            return
         
-        # 3. xxyyをxywhに書き直してsecondaryのBBとする
-        # Secondaryグループを表すShapeオブジェクトを作成
-        secondary_shape = Shape(
-            label=f"secondary",  # ラベルを設定
-            shape_type="rectangle",  # "rectangle"を使用
-            group_id=current_group_id,  # セカンダリーグループIDを設定
-        )
+        # 新しいグループIDを生成
+        current_group_id = str(uuid.uuid4())
+        
+        # セグメントをグループ化して境界ボックスを計算
+        bbox, all_points, primary_ids, segment_ids = self._processSelectedSegments(selected_segments, current_group_id)
+        
+        # primaryセグメントをOBBに変換して表示を更新
+        self._convertPrimaryToOBB(selected_segments, current_group_id)
+        
+        # secondaryセグメント（グループのOBB）を生成
+        secondary_shape = self._createOBBShape(all_points, bbox, current_group_id, "secondary")
         
         # 関連付けられたプライマリーセグメントIDを記録
         setattr(secondary_shape, 'primary_segment_ids', segment_ids)
         
-        # Rectangle型の場合は左上と右下の2点だけを追加
-        secondary_shape.addPoint(QtCore.QPointF(min_x, min_y))  # 左上
-        secondary_shape.addPoint(QtCore.QPointF(max_x, max_y))  # 右下
-        secondary_shape.close()
-        
-        # バウンディングボックスの見た目を設定
-        # 線の色を設定（グループIDに基づく色）
-        r, g, b = self._get_rgb_by_label(current_group_id)
-        secondary_shape.line_color = QtGui.QColor(r, g, b, 200)  # 少し透明に
-        secondary_shape.vertex_fill_color = QtGui.QColor(r, g, b, 120)
-        secondary_shape.fill_color = QtGui.QColor(r, g, b, 30)  # 非常に透明な塗りつぶし
-        
-        # セカンダリーグループをラベルリストに追加
+        # セカンダリーグループを追加
         self.addLabel(secondary_shape)
+
+        # UIの更新
         item = self.labelList.findItemByShape(secondary_shape)
         if item:
             # 追加したアイテムが見つかったら、それを選択して表示
             self.labelList.selectItem(item)
             self.labelList.scrollToItem(item)
-            
             # ラベルテキストを更新して選択されたセグメントIDを表示
             ids_text = ", ".join(segment_ids) if segment_ids else "none"
             item.setText(f"secondary (contains: {ids_text})")
-        
+
         # グループIDをインクリメント
         self.group_id += 1
         self.grouping_complete = True  # グループ分け完了
-        
+
         # キャンバスの状態をリセット
         self.canvas.currentBox = None
         self.canvas.currentPos = None
         self.canvas.currentNeg = None
         self.sam_mask_proposal = []  # プロポーザルをクリア
-        
+
         # UI を更新
+        self.show_proposals()  # プロポーザルを表示
         self.show_proposals()
-        self.canvas.loadShapes([item.shape() for item in self.labelList])  # シェイプを再読み込み
-        
+        self.canvas.loadShapes(
+            [item.shape() for item in self.labelList]
+        )  # シェイプを再読み込み
+
+        # 選択されたセグメントをCSVにエクスポート
         # 選択されたセグメントをCSVにエクスポート - 元のIDを保持したままエクスポート
         self.exportSelectedSegmentsToCSV(selected_segments, current_group_id)
-        
+
         # ボタン状態を更新
         self.actions.save.setEnabled(True)  # 保存ボタンを有効化
         self.actions.editMode.setEnabled(True)  # 編集モードを有効化
+
+    def _convertPrimaryToOBB(self, segments, group_id):
+        """
+        primaryセグメントをOBBに変換する
+        
+        Args:
+            segments: 変換対象のセグメントリスト
+            group_id: グループID
+        """
+        for segment in segments:
+            # オリジナルのセグメント情報を保存
+            setattr(segment, 'original_points', segment.points.copy())
+            setattr(segment, 'original_shape_type', segment.shape_type)
+            setattr(segment, 'is_mask_visible', False)  # マスク表示をOFF
+            
+            # セグメントの点を抽出
+            points = [(p.x(), p.y()) for p in segment.points]
+            # OBB用の空のバウンディングボックス初期化
+            min_x, min_y = float('inf'), float('inf')
+            max_x, max_y = float('-inf'), float('-inf')
+            
+            # 点からバウンディングボックスを計算
+            for point in points:
+                min_x = min(min_x, point[0])
+                min_y = min(min_y, point[1])
+                max_x = max(max_x, point[0])
+                max_y = max(max_y, point[1])
+            
+            # OBBに変換
+            segment.points.clear()  # 既存の点をクリア
+            
+            if len(points) >= 4:
+                # 最小面積の回転した長方形を計算
+                points_array = np.array(points, dtype=np.float32)
+                rect = cv2.minAreaRect(points_array)
+                box_points = cv2.boxPoints(rect)
+                
+                # OBBの頂点を追加
+                for point in box_points:
+                    segment.addPoint(QtCore.QPointF(point[0], point[1]))
+                
+                segment.shape_type = "polygon"  # ポリゴンとして扱う
+            else:
+                # 点が少ない場合は通常の矩形を使用
+                segment.addPoint(QtCore.QPointF(min_x, min_y))
+                segment.addPoint(QtCore.QPointF(max_x, max_y))
+                segment.shape_type = "rectangle"
+            
+            segment.close()
+            
+            # セカンダリーグループIDを関連付け
+            setattr(segment, 'secondary_group_id', group_id)
+            
+            # 見た目を更新
+            self._update_shape_color(segment)
+
+    def _createOBBShape(self, all_points, bbox, group_id, label_prefix):
+        """
+        点群からOBBを生成する
+        
+        Args:
+            all_points: 点の配列
+            bbox: バウンディングボックス（min_x, min_y, max_x, max_y）
+            group_id: グループID
+            label_prefix: ラベルプレフィックス（"primary"または"secondary"）
+        
+        Returns:
+            生成されたShapeオブジェクト
+        """
+        min_x, min_y, max_x, max_y = bbox
+        
+        if len(all_points) >= 4:  # 少なくとも4点が必要
+            points_array = np.array(all_points, dtype=np.float32)
+            # 最小面積の回転した長方形を計算
+            rect = cv2.minAreaRect(points_array)
+            # 長方形の4つの頂点を取得
+            box_points = cv2.boxPoints(rect)
+            
+            # OBBのシェイプを作成
+            shape = Shape(
+                label=f"{label_prefix}",
+                shape_type="polygon",  # OBBはポリゴンとして扱う
+                group_id=group_id,
+            )
+            
+            # OBBの頂点を追加
+            for point in box_points:
+                shape.addPoint(QtCore.QPointF(point[0], point[1]))
+            
+        else:
+            # 点が少ない場合は通常の矩形を使用
+            shape = Shape(
+                label=f"{label_prefix}",
+                shape_type="rectangle",
+                group_id=group_id,
+            )
+            shape.addPoint(QtCore.QPointF(min_x, min_y))
+            shape.addPoint(QtCore.QPointF(max_x, max_y))
+        
+        shape.close()
+        
+        # バウンディングボックスの見た目を設定
+        r, g, b = self._get_rgb_by_label(group_id)
+        shape.line_color = QtGui.QColor(r, g, b, 200)
+        shape.vertex_fill_color = QtGui.QColor(r, g, b, 120)
+        shape.fill_color = QtGui.QColor(r, g, b, 30)
+        
+        return shape
 
     def exportSelectedSegmentsToCSV(self, selected_segments, group_id):
         """
@@ -1806,50 +1992,6 @@ class MainWindow(QMainWindow):
                 "Area[um^2]": round(total_area, 2),
             }
             
-            # 可視化のための画像を作成
-            # if hasattr(self, 'image_np') and self.image_np is not None:
-            #     visualized_image = self.image_np.copy()
-                
-            #     # 一次粒子を描画
-            #     for idx, segment in enumerate(selected_segments):
-            #         points = np.array([[p.x(), p.y()] for p in segment.points])
-            #         cv2.polylines(visualized_image, [points.astype(np.int32)], True, (0, 255, 0), 2)
-                    
-            #         # 一次粒子のIDを描画
-            #         center = np.mean(points, axis=0).astype(int)
-            #         cv2.putText(
-            #             visualized_image,
-            #             f"ID:{segment.particle_id}",
-            #             (center[0], center[1]),
-            #             cv2.FONT_HERSHEY_SIMPLEX,
-            #             0.6,
-            #             (0, 0, 255),
-            #             2,
-            #         )
-                
-            #     # 二次粒子の境界ボックスを描画
-            #     box = cv2.boxPoints(rect)
-            #     box = np.intp(box)
-            #     cv2.drawContours(visualized_image, [box], 0, (255, 0, 255), 2)
-                
-            #     # 二次粒子のIDを描画
-            #     cv2.putText(
-            #         visualized_image,
-            #         f"Group:{group_id}",
-            #         (int(cx), int(cy) - 10),
-            #         cv2.FONT_HERSHEY_SIMPLEX,
-            #         0.8,
-            #         (255, 0, 255),
-            #         2,
-            #     )
-                
-            #     # 可視化画像を保存
-            #     visualized_image_path = f"{self.current_img}_group_{group_id}_visualized.jpg"
-            #     cv2.imwrite(
-            #         visualized_image_path, cv2.cvtColor(visualized_image, cv2.COLOR_RGB2BGR)
-            #     )
-            #     print(f"Visualized image saved: {visualized_image_path}")
-            
             # 全ての粒子情報を結合
             all_particles = primary_particles + [secondary_particle]
             
@@ -1867,12 +2009,9 @@ class MainWindow(QMainWindow):
             
             # CSVにエクスポート
             csv_exporter.export_csv(all_particles, experiment_params, self.current_output_dir)
-            # QMessageBox.information(
-            #     self, 
-            #     self.tr("Info"), 
-            #     self.tr(f"Group {group_id} with {n_particles} particles exported to CSV successfully.")
-            # )
+
         return None
+
     def exportCSVResults(self):
         """
         現在の画像について、self.sam_mask（もしくは他の適切なマスクリスト）から
@@ -2232,6 +2371,13 @@ class MainWindow(QMainWindow):
             bbox_filename = os.path.join(bbox_dir, f"{os.path.basename(filename_base)}_bbox.png")
             cv2.imwrite(bbox_filename, cv2.cvtColor(bbox_img, cv2.COLOR_RGB2BGR))
 
+    def deleteShape(self, shape):
+        if shape in self.selectedShapes:
+            self.selectedShapes.remove(shape)
+        if shape in self.shapes:
+            self.shapes.remove(shape)
+        self.storeShapes()
+        self.update()
 
 def get_parser():
     parser = argparse.ArgumentParser(description="pixel annotator by GroundedSAM")
@@ -2283,7 +2429,7 @@ def get_parser():
         "--image_directory",
         default=None,
         help="Directory containing images to annotate"
-    )
+    )   
     return parser
 
 if __name__ == '__main__':
