@@ -48,6 +48,12 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 import csv_exporter
 from icecream import ic
 
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.models.crystallization_analysis import CrystallizationAnalysis
+
 LABEL_COLORMAP = imgviz.label_colormap()
 
 class MainWindow(QMainWindow):
@@ -723,9 +729,7 @@ class MainWindow(QMainWindow):
         self.canvas.loadShapes([item.shape() for item in self.labelList])
 
     def clickButtonNext(self):
-        e = time.time()
-        ic(e)
-        ic(e - self.s)
+        # e = time.time()
         if self.actions.save.isEnabled():
             self.saveFile()
         if not self.grouping_complete:  # グループ分けが完了していない場合
@@ -1930,13 +1934,6 @@ class MainWindow(QMainWindow):
             secondary_obb: 二次粒子のOBB頂点リスト
             secondary_mask: 二次粒子のマスク配列(numpy.ndarray)
         """
-        # デバッグ用出力
-        for primary in primary_obbs:
-            ic(primary.points)
-        ic(type(primary_masks))
-        for secondary in secondary_obb:
-            ic(secondary)
-        ic(type(secondary_mask))
         
         if not primary_obbs or not secondary_obb or not self.current_img:
             QMessageBox.warning(self, self.tr("Warning"), self.tr("No segments selected or no image loaded"))
@@ -2072,7 +2069,12 @@ class MainWindow(QMainWindow):
             }
             
             # CSVにエクスポート
-            csv_exporter.export_csv(all_particles, experiment_params, self.current_output_dir)
+            csv_path = csv_exporter.export_csv(all_particles, experiment_params, self.current_output_dir)
+            work_dir = self.current_output_dir
+            crystallization = CrystallizationAnalysis(
+                csv_path, work_dir
+            )
+            crystallization(rank_range_min=-50, rank_range_max=750, rank_range_width=50)
 
         return None
 
