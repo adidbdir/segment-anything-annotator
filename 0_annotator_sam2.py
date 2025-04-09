@@ -1463,7 +1463,6 @@ class MainWindow(QMainWindow):
         self._noSelectionSlot = False
         self.canvas.loadShapes(shapes, replace=replace)
 
-
     def moveShape(self):
         self.canvas.endMove(copy=False)
         self.setDirty()
@@ -1474,6 +1473,7 @@ class MainWindow(QMainWindow):
             self.addLabel(shape)
         self.labelList.clearSelection()
         self.setDirty()
+
     def deleteSelectedShape(self):
         """選択されたシェイプを削除し、関連するprimaryを元に戻す"""
         # 選択されたシェイプが存在しない場合は何もしない
@@ -1518,7 +1518,7 @@ class MainWindow(QMainWindow):
             secondary_group_id: 関連するsecondaryグループID
         """
         # デバッグ情報
-        print(f"Restoring primaries: {primary_ids} from secondary: {secondary_group_id}")
+        # print(f"Restoring primaries: {primary_ids} from secondary: {secondary_group_id}")
         
         # 復元されたシェイプを追跡
         restored = False
@@ -1534,10 +1534,10 @@ class MainWindow(QMainWindow):
             
             # 対象のIDを持つプライマリーセグメントを探す
             if shape_id and str(shape_id) in primary_ids:
-                print(f"Found primary to restore: {shape_id}")
+                # print(f"Found primary to restore: {shape_id}")
                 # セカンダリーグループIDが一致するか確認
                 if hasattr(shape, 'secondary_group_id') and shape.secondary_group_id == secondary_group_id:
-                    print(f"Restoring shape with ID: {shape_id}")
+                    # print(f"Restoring shape with ID: {shape_id}")
                     
                     # 元のポイントと形状を復元
                     if hasattr(shape, 'original_points'):
@@ -1661,7 +1661,7 @@ class MainWindow(QMainWindow):
         self.canvas.adjustSize()
         self.canvas.update()
 
-    def _processSelectedSegments(self, selected_segments, current_group_id):
+    def _processSelectedSegments(self, selected_segments):
         """
         選択されたセグメントを処理し、グループ化と境界ボックスの計算を行う
         
@@ -1721,17 +1721,40 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "グループ化するセグメントを選択してください")
             return
         
-        # 新しいグループIDを生成
-        current_group_id = str(uuid.uuid4())
-        
         # セグメントをグループ化して境界ボックスを計算
-        bbox, all_points, primary_ids, segment_ids = self._processSelectedSegments(selected_segments, current_group_id)
-        
+        bbox, all_points, primary_ids, segment_ids = self._processSelectedSegments(
+            selected_segments
+        )
         # primaryセグメントをOBBに変換して表示を更新
-        self._convertPrimaryToOBB(selected_segments, current_group_id)
+        primaries = self._convertPrimaryToOBB(selected_segments)
         
         # secondaryセグメント（グループのOBB）を生成
-        secondary_shape = self._createOBBShape(all_points, bbox, current_group_id, "secondary")
+        secondary_shape = self._createOBBShape(all_points, bbox, "secondary")
+        
+        # SAMでsecondaryマスクを取得
+        secondary_best_mask = None
+        if self.predictor is not None and self.current_img:
+            img = cv2.imread(self.current_img)[:,:,::-1].copy()
+            rh, rw = img.shape[:2]
+            input_box = bbox
+            img, input_box, _ = self.transform_input(img, box=input_box)
+            
+            if not self.image_encoded_flag:
+                self.predictor.set_image(img)
+                self.image_encoded_flag = True
+                
+            masks, iou_prediction, _ = self.predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=input_box[None, :],
+                multimask_output=True,
+            )
+            
+            masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
+            target_idx = np.argmax(iou_prediction)
+            
+            # 最適なマスクを選択
+            secondary_best_mask = masks[target_idx]
         
         # 関連付けられたプライマリーセグメントIDを記録
         setattr(secondary_shape, 'primary_segment_ids', segment_ids)
@@ -1760,21 +1783,24 @@ class MainWindow(QMainWindow):
         self.sam_mask_proposal = []  # プロポーザルをクリア
 
         # UI を更新
-        self.show_proposals()  # プロポーザルを表示
         self.show_proposals()
         self.canvas.loadShapes(
             [item.shape() for item in self.labelList]
-        )  # シェイプを再読み込み
+        )
 
         # 選択されたセグメントをCSVにエクスポート
-        # 選択されたセグメントをCSVにエクスポート - 元のIDを保持したままエクスポート
-        self.exportSelectedSegmentsToCSV(selected_segments, current_group_id)
+        self.exportSelectedSegmentsToCSV(
+            primaries, all_points, secondary_shape, secondary_best_mask
+        )
 
         # ボタン状態を更新
         self.actions.save.setEnabled(True)  # 保存ボタンを有効化
         self.actions.editMode.setEnabled(True)  # 編集モードを有効化
 
-    def _convertPrimaryToOBB(self, segments, group_id):
+        # セカンダリーマスクとL値の可視化
+        self.visualizeSecondaryMaskAndL(secondary_shape, secondary_best_mask)
+
+    def _convertPrimaryToOBB(self, segments):
         """
         primaryセグメントをOBBに変換する
         
@@ -1782,6 +1808,7 @@ class MainWindow(QMainWindow):
             segments: 変換対象のセグメントリスト
             group_id: グループID
         """
+        primaries = []
         for segment in segments:
             # オリジナルのセグメント情報を保存
             setattr(segment, 'original_points', segment.points.copy())
@@ -1824,12 +1851,16 @@ class MainWindow(QMainWindow):
             segment.close()
             
             # セカンダリーグループIDを関連付け
-            setattr(segment, 'secondary_group_id', group_id)
+            setattr(segment, 'secondary_group_id', self.group_id)
             
+            primaries.append(segment)
+
             # 見た目を更新
             self._update_shape_color(segment)
 
-    def _createOBBShape(self, all_points, bbox, group_id, label_prefix):
+        return primaries
+
+    def _createOBBShape(self, all_points, bbox, label_prefix):
         """
         点群からOBBを生成する
         
@@ -1855,7 +1886,7 @@ class MainWindow(QMainWindow):
             shape = Shape(
                 label=f"{label_prefix}",
                 shape_type="polygon",  # OBBはポリゴンとして扱う
-                group_id=group_id,
+                group_id=self.group_id,
             )
             
             # OBBの頂点を追加
@@ -1867,7 +1898,7 @@ class MainWindow(QMainWindow):
             shape = Shape(
                 label=f"{label_prefix}",
                 shape_type="rectangle",
-                group_id=group_id,
+                group_id=self.group_id,
             )
             shape.addPoint(QtCore.QPointF(min_x, min_y))
             shape.addPoint(QtCore.QPointF(max_x, max_y))
@@ -1875,23 +1906,39 @@ class MainWindow(QMainWindow):
         shape.close()
         
         # バウンディングボックスの見た目を設定
-        r, g, b = self._get_rgb_by_label(group_id)
+        r, g, b = self._get_rgb_by_label(self.group_id)
         shape.line_color = QtGui.QColor(r, g, b, 200)
         shape.vertex_fill_color = QtGui.QColor(r, g, b, 120)
         shape.fill_color = QtGui.QColor(r, g, b, 30)
         
         return shape
 
-    def exportSelectedSegmentsToCSV(self, selected_segments, group_id):
+    def exportSelectedSegmentsToCSV(
+        self,
+        primary_obbs,
+        primary_masks,
+        secondary_obb,
+        secondary_mask,
+    ):
         """
         選択されたセグメント（一次粒子）をグループ化した二次粒子としてCSVにエクスポートする
         一次粒子のラベルはそのまま保持し、グループ化情報のみを二次粒子として出力する
         
         Args:
-            selected_segments: グループ化された一次粒子のリスト
-            group_id: 割り当てられたグループID
+            primary_obbs: 一次粒子のOBBのリスト
+            primary_masks: 一次粒子のマスクのリスト
+            secondary_obb: 二次粒子のOBB頂点リスト
+            secondary_mask: 二次粒子のマスク配列(numpy.ndarray)
         """
-        if not selected_segments or not self.current_img:
+        # デバッグ用出力
+        for primary in primary_obbs:
+            ic(primary.points)
+        ic(type(primary_masks))
+        for secondary in secondary_obb:
+            ic(secondary)
+        ic(type(secondary_mask))
+        
+        if not primary_obbs or not secondary_obb or not self.current_img:
             QMessageBox.warning(self, self.tr("Warning"), self.tr("No segments selected or no image loaded"))
             return
         
@@ -1904,7 +1951,6 @@ class MainWindow(QMainWindow):
         # 一次粒子情報を収集
         primary_particles = []
         primary_ids = []
-        all_points = []  # 二次粒子の境界を計算するための全ポイント
         
         # 通し番号用のカウンタ 
         # 既存の通し番号を継続するため、現在の最大IDを取得
@@ -1913,36 +1959,47 @@ class MainWindow(QMainWindow):
             if hasattr(shape, 'particle_id') and shape.particle_id is not None:
                 max_id = max(max_id, shape.particle_id)
         
-        for idx, segment in enumerate(selected_segments):
+        # 各一次粒子の処理
+        for idx, (segment, mask) in enumerate(zip(primary_obbs, primary_masks)):
             # 各セグメントに一意なIDを割り当て
-            # 既にparticle_idを持っていればそれを使用、なければ新たに割り当て
             if not hasattr(segment, 'particle_id') or segment.particle_id is None:
                 segment.particle_id = max_id + idx + 1
             
             particle_id = segment.particle_id
             primary_ids.append(particle_id)
             
-            # 輪郭点をNumPy配列に変換
+            # OBBの点を取得して長さを計算
             points = np.array([[p.x(), p.y()] for p in segment.points])
-            all_points.extend(points)
             
             # OpenCVの関数で形状解析
-            if len(points) > 2:  # 最低3点必要
+            if len(points) >= 4:  # OBBは4点必要
+                # OBBから長さを計算
                 rect = cv2.minAreaRect(points.astype(np.float32))
                 (cx, cy), (width, height), angle = rect
                 
-                # 面積計算
-                area = cv2.contourArea(points.astype(np.int32))
-                
-                # 一次粒子情報を保存
                 lmajor = max(width, height) * scale
                 lminor = min(width, height) * scale
                 l = (lmajor + lminor) / 2
                 
+                # マスクから面積を計算
+                area = 0
+                if mask is not None:
+                    # マスクが画像サイズならnon-zeroピクセル数をカウント
+                    if isinstance(mask, np.ndarray):
+                        area = np.count_nonzero(mask) * scale**2
+                    # マスクがポリゴンなら輪郭点から面積計算
+                    elif hasattr(mask, 'points'):
+                        mask_points = np.array([[p.x(), p.y()] for p in mask.points])
+                        area = cv2.contourArea(mask_points.astype(np.int32)) * scale**2
+                else:
+                    # マスクがない場合はOBBから面積を概算
+                    area = width * height * scale**2
+                
+                # 一次粒子情報を保存
                 primary_particles.append({
                     "image_filename": image_filename,
                     "particle_id": particle_id,
-                    "secondary_id": group_id,
+                    "secondary_id": getattr(segment, 'secondary_group_id', ""),
                     "particle_type": segment.label,  # 元のラベルを保持
                     "Lmajor [um]": round(lmajor, 3),
                     "Lminor [um]": round(lminor, 3),
@@ -1950,15 +2007,16 @@ class MainWindow(QMainWindow):
                     "Lmean[um]": "",
                     "n": "",
                     "Agg.": "",
-                    "Area[um^2]": round(area * scale**2, 2),
+                    "Area[um^2]": round(area, 2),
                 })
         
         # 二次粒子情報を計算
-        if all_points:
-            all_points = np.array(all_points)
+        if secondary_obb:
+            # 二次粒子のOBB頂点から長さを計算
+            secondary_points = np.array([[p.x(), p.y()] for p in secondary_obb])
             
-            # 二次粒子の境界ボックスを計算
-            rect = cv2.minAreaRect(all_points.astype(np.float32))
+            # OBBから長さを計算
+            rect = cv2.minAreaRect(secondary_points.astype(np.float32))
             (cx, cy), (width, height), angle = rect
             
             lmajor_secondary = max(width, height) * scale
@@ -1973,15 +2031,21 @@ class MainWindow(QMainWindow):
             n_particles = len(primary_particles)
             aggregation = l_secondary / lmean if lmean > 0 else 0
             
-            # 総面積を計算
-            hull = cv2.convexHull(all_points.astype(np.int32))
-            total_area = cv2.contourArea(hull) * scale**2
+            # マスクから面積を計算
+            total_area = 0
+            if secondary_mask is not None:
+                # NumPy配列の場合は非ゼロピクセル数をカウント
+                if isinstance(secondary_mask, np.ndarray):
+                    total_area = np.count_nonzero(secondary_mask) * scale**2
+            else:
+                # マスクがない場合はOBBから面積を概算
+                total_area = width * height * scale**2
             
-            # 二次粒子情報を追加 (これは新たに生成される二次粒子)
+            # 二次粒子情報を追加
             secondary_particle = {
                 "image_filename": image_filename,
                 "particle_id": ",".join(map(str, primary_ids)),  # コンマ区切りの一次粒子ID
-                "secondary_id": group_id,
+                "secondary_id": getattr(primary_obbs[0], 'secondary_group_id', "") if primary_obbs else "",
                 "particle_type": "secondary",  # 二次粒子としてマーク
                 "Lmajor [um]": round(lmajor_secondary, 3),
                 "Lminor [um]": round(lminor_secondary, 3),
@@ -2012,270 +2076,6 @@ class MainWindow(QMainWindow):
 
         return None
 
-    def exportCSVResults(self):
-        """
-        現在の画像について、self.sam_mask（もしくは他の適切なマスクリスト）から
-        解析結果を計算し、csv_exporter を利用して CSV 出力する。
-        CSV のファイル名は、実験パラメータ（date, experimenter, impurity_type, impurity_concentration,
-        seed_size, crystallization_time, suspension_density, image_scaler）から構築する。
-        """
-        if not self.current_img:
-            QMessageBox.warning(self, self.tr("Warning"), self.tr("No image loaded"))
-            return None, None, None
-
-        primaries = self.canvas.selectedShapes
-        secondaries_id = self.group_id
-        visualized_image = self.image_np.copy()
-        primary_particles = {}
-        secondary_particles = {}
-        group_to_primary_ids = {}
-
-        # まず一次粒子を処理
-        for primary in primaries:
-            if primary.label == "polygon":
-                mask = primary.points
-                idx = primary.group_id
-                group_to_primary_ids.append(idx)
-                # マスクを2次元のuint8形式に変換
-                # 例：segment.pointsがQPointFオブジェクトのリストの場合
-                binary_mask = np.array(
-                    [[int(pt.x()), int(pt.y())] for pt in mask], dtype=np.uint8
-                )
-                # binary_mask = points_uint8.squeeze().astype(np.uint8)
-
-                # マスクが空でないか確認
-                if np.any(binary_mask):
-                    contours, _ = cv2.findContours(
-                        binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
-
-                    for contour in contours:
-                        # 面積でフィルタリング
-                        area = cv2.contourArea(contour)
-                        if area < 10:  # 面積が小さい場合はスキップ
-                            print(f"Mask {idx}: Skipped due to small area ({area}).")
-                            continue
-
-                        # Oriented Bounding Box (OBB)
-                        rect = cv2.minAreaRect(contour)
-                        (cx, cy), (width, height), angle = rect
-
-                        if width == 0 or height == 0:  # 幅または高さが0の場合スキップ
-                            print(
-                                f"Mask {idx}: Skipped due to invalid OBB dimensions (width={width}, height={height})."
-                            )
-                            continue
-
-                        # OBBの四角形を取得
-                        box = cv2.boxPoints(rect)
-                        box = np.intp(box)
-                        cv2.drawContours(
-                            visualized_image, [box], 0, (0, 255, 255), 2
-                        )  # 黄色でOBBを描画
-
-                        # OBBの中心から両矢印で幅と高さを描画
-                        center = (int(cx), int(cy))
-                        angle_rad = np.radians(angle)
-
-                        width_vector = (
-                            (width / 2) * np.cos(angle_rad),
-                            (width / 2) * np.sin(angle_rad),
-                        )
-                        height_vector = (
-                            (height / 2) * np.sin(angle_rad),
-                            -(height / 2) * np.cos(angle_rad),
-                        )
-
-                        width_arrow_start = (
-                            int(cx - width_vector[0]),
-                            int(cy - width_vector[1]),
-                        )
-                        width_arrow_end = (
-                            int(cx + width_vector[0]),
-                            int(cy + width_vector[1]),
-                        )
-
-                        height_arrow_start = (
-                            int(cx - height_vector[0]),
-                            int(cy - height_vector[1]),
-                        )
-                        height_arrow_end = (
-                            int(cx + height_vector[0]),
-                            int(cy + height_vector[1]),
-                        )
-
-                        # 両矢印を描画 (幅: 緑, 高さ: ピンク)
-                        cv2.arrowedLine(
-                            visualized_image,
-                            width_arrow_start,
-                            width_arrow_end,
-                            (0, 255, 0),
-                            2,
-                            tipLength=0.1,
-                        )
-                        cv2.arrowedLine(
-                            visualized_image,
-                            width_arrow_end,
-                            width_arrow_start,
-                            (0, 255, 0),
-                            2,
-                            tipLength=0.1,
-                        )
-                        cv2.arrowedLine(
-                            visualized_image,
-                            height_arrow_start,
-                            height_arrow_end,
-                            (255, 105, 180),
-                            2,
-                            tipLength=0.1,
-                        )
-                        cv2.arrowedLine(
-                            visualized_image,
-                            height_arrow_end,
-                            height_arrow_start,
-                            (255, 105, 180),
-                            2,
-                            tipLength=0.1,
-                        )
-
-                        # ラベル（ID）を描画
-                        label_position = (int(cx), int(cy) - 10)
-                        cv2.putText(
-                            visualized_image,
-                            f"ID:{idx}",
-                            label_position,
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8,
-                            (0, 0, 255),
-                            2,
-                        )
-
-                        # 結果を保存
-                        lmajor = max(width, height) * float(
-                            self.image_scaler_edit.text() or "1.0"
-                        )
-                        lminor = min(width, height) * float(
-                            self.image_scaler_edit.text() or "1.0"
-                        )
-                        area_um = (
-                            area * float(self.image_scaler_edit.text() or "1.0") ** 2
-                        )
-
-                        # 一次粒子情報を保存
-                        primary_particles[idx] = {
-                            "image_filename": os.path.basename(self.current_img),
-                            "particle_id": idx,
-                            "secondary_id": secondaries_id,  # 後で更新
-                            "particle_type": primary.label,
-                            "Lmajor [um]": lmajor,
-                            "Lminor [um]": lminor,
-                            "L[um]": (lmajor + lminor) / 2,  # 平均長さ
-                            "area": area_um,
-                            "contour": contour,  # 後で面積計算などに使用
-                        }
-                else:
-                    print(f"Mask {idx} is empty and skipped.")
-
-        # 各一次粒子がどの二次粒子に属しているかを確認
-        for id in group_to_primary_ids:
-            shape = item.shape()
-
-            # group_idがNoneでない場合、そのグループに属している
-            if shape.group_id is not None and shape.label == "secondary":
-                # グループIDが存在しない場合は初期化
-                if shape.group_id not in group_to_primary_ids:
-                    group_to_primary_ids[shape.group_id] = []
-
-                # このグループに属する一次粒子を探す
-                for primary_id, primary_info in primary_particles.items():
-                    # 主粒子の輪郭と二次粒子の形状が重なるかをチェック
-                    # 現在はシンプルに所属関係を処理するため、一次粒子のIDをグループに追加
-                    primary_info["secondary_id"] = shape.group_id
-                    group_to_primary_ids[shape.group_id].append(primary_id)
-
-        # 二次粒子の情報を計算
-        for group_id, primary_ids in group_to_primary_ids.items():
-            if not primary_ids:  # 一次粒子がない場合はスキップ
-                continue
-
-            # このグループに属する一次粒子の統計情報を計算
-            lmajor_values = [
-                primary_particles[pid]["Lmajor [um]"] for pid in primary_ids
-            ]
-            lminor_values = [
-                primary_particles[pid]["Lminor [um]"] for pid in primary_ids
-            ]
-            l_values = [primary_particles[pid]["L[um]"] for pid in primary_ids]
-            area_values = [primary_particles[pid]["area"] for pid in primary_ids]
-
-            # 二次粒子の寸法は、含まれる一次粒子の最大の長さと幅を使用
-            combined_contours = np.vstack(
-                [primary_particles[pid]["contour"] for pid in primary_ids]
-            )
-            rect = cv2.minAreaRect(combined_contours)
-            (cx, cy), (width, height), angle = rect
-
-            lmajor_secondary = max(width, height) * float(
-                self.image_scaler_edit.text() or "1.0"
-            )
-            lminor_secondary = min(width, height) * float(
-                self.image_scaler_edit.text() or "1.0"
-            )
-
-            # 総面積を計算（簡易的な実装）
-            total_area = sum(area_values)
-
-            # 平均サイズを計算
-            lmean = sum(l_values) / len(l_values)
-
-            # 凝集度（Aggregation）の計算 - 二次粒子の大きさ/一次粒子の平均大きさ
-            n_particles = len(primary_ids)
-            aggregation = (
-                ((lmajor_secondary + lminor_secondary) / 2) / lmean if lmean > 0 else 0
-            )
-
-            # 二次粒子情報を保存
-            secondary_particles[group_id] = {
-                "image_filename": os.path.basename(self.current_img),
-                "particle_id": ",".join(
-                    map(str, primary_ids)
-                ),  # コンマ区切りの一次粒子ID
-                "secondary_id": group_id,
-                "particle_type": "secondary",
-                "Lmajor [um]": lmajor_secondary,
-                "Lminor [um]": lminor_secondary,
-                "L[um]": (lmajor_secondary + lminor_secondary) / 2,
-                "Lmean[um]": lmean,
-                "n": n_particles,
-                "Agg.": round(aggregation, 2),
-                "Area[um^2]": round(total_area, 2),
-            }
-
-        # 可視化画像を保存
-        # visualized_image_path = (f"{self.current_img}_visualized.jpg")
-        # cv2.imwrite(
-        #     visualized_image_path, cv2.cvtColor(visualized_image, cv2.COLOR_RGB2BGR)
-        # )
-        # print(f"visualized_image_path: {visualized_image_path}")
-
-        # if not results:
-        #     QMessageBox.information(self, self.tr("Info"), self.tr("No valid masks for analysis."))
-        #     return None, None, None
-
-        # 実験パラメータの取得（showExperimentParamsDialog で更新された隠し QLineEdit から）
-        experiment_params = {
-            "date": self.date_edit.text(),
-            "experimenter": self.experimenter_edit.text(),
-            "impurity_type": self.impurity_type_edit.text(),
-            "impurity_concentration": self.impurity_conc_edit.text(),
-            "seed_size": self.seed_size_edit.text(),
-            "crystallization_time": self.crystal_time_edit.text(),
-            "suspension_density": self.suspension_density_edit.text(),
-            "image_scaler": self.image_scaler_edit.text(),
-        }
-        # return results, experiment_params, self.current_output_dir
-        return primary_particles, experiment_params, self.current_output_dir
-    
     def saveMaskAndBBoxImages(self, filename_base):
         """
         アノテーションデータに基づいてマスク画像とバウンディングボックス画像を保存する
@@ -2378,6 +2178,172 @@ class MainWindow(QMainWindow):
             self.shapes.remove(shape)
         self.storeShapes()
         self.update()
+
+    def visualizeSecondaryMaskAndL(self, secondary_obb, secondary_mask):
+        """
+        secondaryマスクとL値（長軸・短軸）を可視化する
+        
+        Args:
+            secondary_obb: 二次粒子のOBB
+            secondary_mask: 二次粒子のマスク画像
+        """
+        if secondary_obb is None or secondary_mask is None or not self.current_img:
+            QMessageBox.warning(self, "警告", "可視化するデータがありません")
+            return
+        
+        # 元画像の読み込み
+        original_img = cv2.imread(self.current_img)
+        original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+        h, w = original_img.shape[:2]
+        
+        # 可視化用の画像を作成（元画像のコピー）
+        visualization_img = original_img.copy()
+        
+        # スケーリング係数を取得
+        scale = float(self.image_scaler_edit.text() or "1.0")
+        
+        # 1. マスクの可視化（半透明のオーバーレイ）
+        if isinstance(secondary_mask, np.ndarray) and secondary_mask.shape[:2] == (h, w):
+            # マスク領域を赤色で半透明にオーバーレイ
+            mask_overlay = visualization_img.copy()
+            mask_overlay[secondary_mask > 0] = np.array([255, 0, 0])  # 赤色
+            
+            # 半透明合成
+            alpha = 0.4  # 透明度
+            visualization_img = cv2.addWeighted(mask_overlay, alpha, visualization_img, 1 - alpha, 0)
+        
+        # 2. OBBの可視化と長軸・短軸の描画
+        if secondary_obb:
+            # OBBの頂点を取得（すでに存在する点を使用）
+            points = np.array([[p.x(), p.y()] for p in secondary_obb.points], dtype=np.int32)
+            
+            # OBBを描画
+            cv2.drawContours(visualization_img, [points], 0, (0, 255, 0), 2)
+            
+            # OBBの中心点を計算
+            cx = np.mean(points[:, 0])
+            cy = np.mean(points[:, 1])
+            
+            # 対角点のペアを計算（0-2と1-3が対角）
+            diag1 = np.linalg.norm(points[0] - points[2])
+            diag2 = np.linalg.norm(points[1] - points[3])
+            
+            # 辺の長さを計算
+            edge1 = np.linalg.norm(points[0] - points[1])
+            edge2 = np.linalg.norm(points[1] - points[2])
+            
+            # 長軸と短軸の長さを特定
+            lmajor = max(edge1, edge2) * scale
+            lminor = min(edge1, edge2) * scale
+            
+            # 長軸と短軸のベクトルを計算
+            if edge1 > edge2:
+                # edge1が長軸の場合
+                major_vec = points[1] - points[0]
+                minor_vec = points[2] - points[1]
+            else:
+                # edge2が長軸の場合
+                major_vec = points[2] - points[1]
+                minor_vec = points[1] - points[0]
+            
+            # ベクトルの正規化
+            major_vec = major_vec / np.linalg.norm(major_vec) * max(edge1, edge2) / 2
+            minor_vec = minor_vec / np.linalg.norm(minor_vec) * min(edge1, edge2) / 2
+            
+            # 長軸の描画（赤い矢印）
+            start_major = (int(cx), int(cy))
+            end_major = (int(cx + major_vec[0]), int(cy + major_vec[1]))
+            cv2.arrowedLine(visualization_img, start_major, end_major, (255, 0, 0), 2)
+            
+            # 反対側の矢印も描画
+            end_major_opposite = (int(cx - major_vec[0]), int(cy - major_vec[1]))
+            cv2.arrowedLine(visualization_img, start_major, end_major_opposite, (255, 0, 0), 2)
+            
+            # 短軸の描画（青い矢印）
+            start_minor = (int(cx), int(cy))
+            end_minor = (int(cx + minor_vec[0]), int(cy + minor_vec[1]))
+            cv2.arrowedLine(visualization_img, start_minor, end_minor, (0, 0, 255), 2)
+            
+            # 反対側の矢印も描画
+            end_minor_opposite = (int(cx - minor_vec[0]), int(cy - minor_vec[1]))
+            cv2.arrowedLine(visualization_img, start_minor, end_minor_opposite, (0, 0, 255), 2)
+            
+            # L値のテキスト表示
+            cv2.putText(
+                visualization_img, 
+                f"Lmajor: {lmajor:.1f} um", 
+                (int(cx) + 20, int(cy) - 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.7, 
+                (255, 0, 0), 
+                2
+            )
+            cv2.putText(
+                visualization_img, 
+                f"Lminor: {lminor:.1f} um", 
+                (int(cx) + 20, int(cy) + 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.7, 
+                (0, 0, 255), 
+                2
+            )
+        
+        # GUIウィンドウは使用せず、直接ファイルに保存
+        output_dir = os.path.join(self.current_output_dir, "visualizations")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        image_basename = os.path.basename(self.current_img)
+        filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz.png")
+        cv2.imwrite(filename, cv2.cvtColor(visualization_img, cv2.COLOR_RGB2BGR))
+        
+        # 結果表示をPyQtのQPixmapを使って行う
+        try:
+            # PyQtで可視化画像を表示するダイアログを作成
+            vis_dialog = QtWidgets.QDialog(self)
+            vis_dialog.setWindowTitle("Secondary Mask & L Visualization")
+            
+            # レイアウトの設定
+            layout = QtWidgets.QVBoxLayout(vis_dialog)
+            
+            # QPixmapに変換
+            height, width = visualization_img.shape[:2]
+            bytes_per_line = 3 * width
+            q_img = QtGui.QImage(
+                visualization_img.data, 
+                width, 
+                height, 
+                bytes_per_line, 
+                QtGui.QImage.Format_RGB888
+            )
+            pixmap = QtGui.QPixmap.fromImage(q_img)
+            
+            # 表示サイズに合わせてスケーリング
+            scaled_pixmap = pixmap.scaled(
+                800, 
+                600, 
+                QtCore.Qt.KeepAspectRatio, 
+                QtCore.Qt.SmoothTransformation
+            )
+            
+            # ラベルに画像をセット
+            image_label = QtWidgets.QLabel()
+            image_label.setPixmap(scaled_pixmap)
+            layout.addWidget(image_label)
+            
+            # 情報テキスト
+            info_text = QtWidgets.QLabel(f"画像を {filename} に保存しました")
+            layout.addWidget(info_text)
+            
+            # OKボタン
+            ok_button = QtWidgets.QPushButton("OK")
+            ok_button.clicked.connect(vis_dialog.accept)
+            layout.addWidget(ok_button)
+            
+            # ダイアログを表示
+            vis_dialog.exec_()
+        except Exception as e:
+            # GUIエラーが発生した場合は単純にメッセージボックスを表示
+            QMessageBox.information(self, "保存完了", f"可視化画像を {filename} に保存しました")
 
 def get_parser():
     parser = argparse.ArgumentParser(description="pixel annotator by GroundedSAM")
