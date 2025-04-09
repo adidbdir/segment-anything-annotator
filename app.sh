@@ -1,0 +1,1 @@
+uv run 0_annotator_sam2.py --category_file primary.txt --save_labels --image_directory cal/0
