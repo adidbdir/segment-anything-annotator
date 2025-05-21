@@ -17,7 +17,7 @@ import base64
 import csv
 import uuid
 
-from PyQt5.QtWidgets import QWidget, QApplication, QMainWindow, QApplication, QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, QScrollArea, QDockWidget, QMessageBox, QLineEdit, QCheckBox
+from PyQt5.QtWidgets import QWidget, QApplication, QMainWindow, QApplication, QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, QScrollArea, QDockWidget, QMessageBox, QLineEdit, QCheckBox, QSpinBox
 from PyQt5.QtGui import QPixmap, QIcon, QImage
 from PyQt5.Qt import QSize
 from qtpy.QtCore import Qt
@@ -583,6 +583,22 @@ class MainWindow(QMainWindow):
         self.find_scalebar_button.move(int(0.77 * global_w), int(0.95 * global_h))
         self.find_scalebar_button.resize(int(0.2 * global_w), int(0.03 * global_h))
     
+        # Add area threshold UI
+        self.area_threshold = 100  # Default value
+        self.area_threshold_label = QtWidgets.QLabel(self.tr("Area Threshold:"), self)
+        self.area_threshold_spinbox = QtWidgets.QSpinBox(self)
+        self.area_threshold_spinbox.setMinimum(0)
+        self.area_threshold_spinbox.setMaximum(1000000) # Adjust max as needed
+        self.area_threshold_spinbox.setValue(self.area_threshold)
+        self.area_threshold_spinbox.setSingleStep(10)
+        self.area_threshold_spinbox.valueChanged.connect(self.update_area_threshold)
+
+        # Layout for area threshold (example placement, adjust as needed)
+        # Assuming you want to place it near other settings like save checkboxes
+        self.area_threshold_label.move(int(0.01 * global_w), int(0.92 * global_h)) # Adjust position
+        self.area_threshold_spinbox.move(int(0.12 * global_w), int(0.92 * global_h)) # Adjust position
+        self.area_threshold_spinbox.resize(int(0.07 * global_w), int(0.025 * global_h)) # Adjust size
+
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
         self._saveFile(self.saveFileDialog())
@@ -1123,45 +1139,72 @@ class MainWindow(QMainWindow):
         if self.image_encoded_flag == False:
             self.predictor.set_image(img)
             self.image_encoded_flag = True
-        masks, iou_prediction, _ = self.predictor.predict(
+        masks_sam_raw, iou_prediction, _ = self.predictor.predict(
             point_coords=None,
             point_labels=None,
             box=input_box[None, :],
             multimask_output=True,
         )
-        self.masks = masks
-        masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
+        # self.masks = masks_sam_raw # Store raw SAM masks if needed for other purposes
 
-        target_idx = np.argmax(iou_prediction)
-        self.show_proposals(masks, 0)
+        # Transform raw masks to original image dimensions
+        masks_sam_transformed = self.transform_output(masks_sam_raw.astype(np.uint8), (rh,rw))
+
+        # Filter and reconstruct masks for display and shape creation
+        # self.area_threshold is updated by the QSpinBox
+        filtered_masks_for_show_and_shape = self.filter_and_reconstruct_masks(
+            masks_sam_transformed, 
+            self.area_threshold
+        )
+
+        # Show proposals using filtered masks
+        self.show_proposals(filtered_masks_for_show_and_shape, 0) 
+        
         self.sam_mask_proposal = []
-        for msk_idx in range(masks.shape[0]):
-            mask = masks[msk_idx].astype(np.uint8)
+        # Determine target_idx based on iou_prediction from unfiltered masks
+        # This ensures the "best" proposal is still based on SAM's original confidence
+        target_idx = np.argmax(iou_prediction) 
 
-            points_list = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[0]
+        for msk_idx in range(filtered_masks_for_show_and_shape.shape[0]):
+            # Use the filtered mask to find contours for Shape objects
+            mask_for_shape_creation = filtered_masks_for_show_and_shape[msk_idx].astype(np.uint8)
+            
+            # Ensure mask_for_shape_creation is C-contiguous
+            mask_for_shape_creation_contiguous = np.ascontiguousarray(mask_for_shape_creation)
+            
+            points_list = cv2.findContours(mask_for_shape_creation_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
             shape_type = 'polygon'
-            tmp_sam_mask = []
+            tmp_sam_mask_shapes = [] # Stores Shape objects for the current proposal
+
+            if not points_list: # If filtering removed all contours
+                if msk_idx == target_idx:
+                    self.sam_mask = []
+                self.sam_mask_proposal.append([])
+                continue
+
             for points in points_list:
-                area = cv2.contourArea(points)
-                if area < 100 and len(points_list) > 1:
-                    continue
+                # Since the mask for `points_list` is already filtered,
+                # we don't need to re-check area here unless there's a specific reason.
+                # area = cv2.contourArea(points)
+                # if area == 0: # Or some very small threshold if `filter_and_reconstruct_masks` might leave tiny artifacts
+                #     continue
+
                 pointsx = points[:,0,0]
                 pointsy = points[:,0,1]
 
                 shape = Shape(
-                    label='Object',
+                    label='Object', # Default label
                     shape_type=shape_type,
                     group_id=self.getMaxId() + 1,
                 )
                 for point_index in range(pointsx.shape[0]):
                     shape.addPoint(QtCore.QPointF(pointsx[point_index], pointsy[point_index]))
                 shape.close()
-                #self.addLabel(shape)
-                tmp_sam_mask.append(shape)
+                tmp_sam_mask_shapes.append(shape)
+            
             if msk_idx == target_idx:
-                self.sam_mask = tmp_sam_mask
-            self.sam_mask_proposal.append(tmp_sam_mask)
-
+                self.sam_mask = tmp_sam_mask_shapes 
+            self.sam_mask_proposal.append(tmp_sam_mask_shapes)
 
     def clickManualSegBox(self):
         ClickPos = self.canvas.currentPos
@@ -1194,45 +1237,103 @@ class MainWindow(QMainWindow):
         if self.image_encoded_flag == False:
             self.predictor.set_image(img)
             self.image_encoded_flag = True
-        masks, iou_prediction, _ = self.predictor.predict(
+        masks_sam_raw, iou_prediction, _ = self.predictor.predict(
             point_coords=input_clicks,
             point_labels=input_types,
             multimask_output=True,
         )
-        self.masks = masks
-        masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
+        # self.masks = masks_sam_raw # Store raw SAM masks if needed for other purposes
+
+        # Transform raw masks to original image dimensions
+        masks_sam_transformed = self.transform_output(masks_sam_raw.astype(np.uint8), (rh,rw))
+
+        # Filter and reconstruct masks for display and shape creation
+        # self.area_threshold is updated by the QSpinBox
+        filtered_masks_for_show_and_shape = self.filter_and_reconstruct_masks(
+            masks_sam_transformed, 
+            self.area_threshold
+        )
+
+        # Show proposals using filtered masks
+        self.show_proposals(filtered_masks_for_show_and_shape, 0) 
         
-        target_idx = np.argmax(iou_prediction)
-        self.show_proposals(masks,0)
         self.sam_mask_proposal = []
-        
-        for msk_idx in range(masks.shape[0]):
-            mask = masks[msk_idx].astype(np.uint8)
+        # Determine target_idx based on iou_prediction from unfiltered masks
+        # This ensures the "best" proposal is still based on SAM's original confidence
+        target_idx = np.argmax(iou_prediction) 
+
+        for msk_idx in range(filtered_masks_for_show_and_shape.shape[0]):
+            # Use the filtered mask to find contours for Shape objects
+            mask_for_shape_creation = filtered_masks_for_show_and_shape[msk_idx].astype(np.uint8)
             
-            points_list = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[0]
+            # Ensure mask_for_shape_creation is C-contiguous
+            mask_for_shape_creation_contiguous = np.ascontiguousarray(mask_for_shape_creation)
+            
+            points_list = cv2.findContours(mask_for_shape_creation_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
             shape_type = 'polygon'
-            tmp_sam_mask = []
+            tmp_sam_mask_shapes = [] # Stores Shape objects for the current proposal
+
+            if not points_list: # If filtering removed all contours
+                if msk_idx == target_idx:
+                    self.sam_mask = []
+                self.sam_mask_proposal.append([])
+                continue
+
             for points in points_list:
-                area = cv2.contourArea(points)
-                if area < 100 and len(points_list) > 1:
-                    continue
+                # Since the mask for `points_list` is already filtered,
+                # we don't need to re-check area here unless there's a specific reason.
+                # area = cv2.contourArea(points)
+                # if area == 0: # Or some very small threshold if `filter_and_reconstruct_masks` might leave tiny artifacts
+                #     continue
+
                 pointsx = points[:,0,0]
                 pointsy = points[:,0,1]
 
                 shape = Shape(
-                    label='Object',
+                    label='Object', # Default label
                     shape_type=shape_type,
                     group_id=self.getMaxId() + 1,
                 )
                 for point_index in range(pointsx.shape[0]):
                     shape.addPoint(QtCore.QPointF(pointsx[point_index], pointsy[point_index]))
                 shape.close()
-                #self.addLabel(shape)
-                tmp_sam_mask.append(shape)
+                tmp_sam_mask_shapes.append(shape)
+            
             if msk_idx == target_idx:
-                self.sam_mask = tmp_sam_mask
-            self.sam_mask_proposal.append(tmp_sam_mask)
-    
+                self.sam_mask = tmp_sam_mask_shapes 
+            self.sam_mask_proposal.append(tmp_sam_mask_shapes)
+
+    def filter_and_reconstruct_masks(self, masks_to_filter, area_threshold):
+        if masks_to_filter is None or masks_to_filter.ndim != 3:
+            return np.array([]) # Return empty if input is not as expected
+
+        num_masks, h, w = masks_to_filter.shape
+        # Ensure the output array is correctly initialized for boolean or uint8 masks
+        filtered_reconstructed_masks = np.zeros_like(masks_to_filter, dtype=np.uint8)
+
+        for i in range(num_masks):
+            current_mask_slice = masks_to_filter[i]
+            # Ensure current_mask_slice is C-contiguous and uint8 for findContours
+            current_mask_contiguous = np.ascontiguousarray(current_mask_slice, dtype=np.uint8)
+            
+            contours, _ = cv2.findContours(current_mask_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours: # No contours found for this mask slice
+                continue
+
+            valid_contours = []
+            for contour in contours: # Iterate through all found external contours for this mask slice
+                area = cv2.contourArea(contour)
+                if area >= area_threshold: # Apply threshold to ALL contours
+                    valid_contours.append(contour)
+            
+            if valid_contours: # If any contours passed the threshold
+                # Draw all valid contours onto the new mask for this index
+                cv2.drawContours(filtered_reconstructed_masks[i], valid_contours, -1, (255), thickness=cv2.FILLED)
+            # If no valid_contours, filtered_reconstructed_masks[i] remains all zeros, which is correct (empty mask)
+                
+        return filtered_reconstructed_masks
+
     def addSamMask(self):
         if len(self.sam_mask) > 0:
             label = self.default_label if self.default_label else 'Object'  # 自動設定ラベルを使用
@@ -2443,6 +2544,42 @@ class MainWindow(QMainWindow):
         image_basename = os.path.basename(self.current_img)
         filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz.png")
         cv2.imwrite(filename, cv2.cvtColor(visualization_img, cv2.COLOR_RGB2BGR))
+
+    def update_area_threshold(self, value):
+        self.area_threshold = value
+        # Optionally, if a mask proposal is already shown, you might want to re-filter and update it.
+        # This depends on the desired UX. For now, new proposals will use the new threshold.
+
+    def filter_and_reconstruct_masks(self, masks_to_filter, area_threshold):
+        if masks_to_filter is None or masks_to_filter.ndim != 3:
+            return np.array([]) # Return empty if input is not as expected
+
+        num_masks, h, w = masks_to_filter.shape
+        # Ensure the output array is correctly initialized for boolean or uint8 masks
+        filtered_reconstructed_masks = np.zeros_like(masks_to_filter, dtype=np.uint8)
+
+        for i in range(num_masks):
+            current_mask_slice = masks_to_filter[i]
+            # Ensure current_mask_slice is C-contiguous and uint8 for findContours
+            current_mask_contiguous = np.ascontiguousarray(current_mask_slice, dtype=np.uint8)
+            
+            contours, _ = cv2.findContours(current_mask_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours: # No contours found for this mask slice
+                continue
+
+            valid_contours = []
+            for contour in contours: # Iterate through all found external contours for this mask slice
+                area = cv2.contourArea(contour)
+                if area >= area_threshold: # Apply threshold to ALL contours
+                    valid_contours.append(contour)
+            
+            if valid_contours: # If any contours passed the threshold
+                # Draw all valid contours onto the new mask for this index
+                cv2.drawContours(filtered_reconstructed_masks[i], valid_contours, -1, (255), thickness=cv2.FILLED)
+            # If no valid_contours, filtered_reconstructed_masks[i] remains all zeros, which is correct (empty mask)
+                
+        return filtered_reconstructed_masks
 
 def get_parser():
     parser = argparse.ArgumentParser(description="pixel annotator by GroundedSAM")
