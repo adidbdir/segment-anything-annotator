@@ -77,6 +77,11 @@ class Canvas(QtWidgets.QWidget):
         self.currentBox = None
         self.selectedShapes = []  # save the selected shapes here
         self.selectedShapesCopy = []
+        
+        # スケールバーモード関連の変数
+        self.scale_mode = False  # スケールバーモード
+        self.scale_points = []  # スケールバーの点の座標
+        
         # self.line represents:
         #   - createMode == 'polygon': edge from last point to current
         #   - createMode == 'rectangle': diagonal line of the rectangle
@@ -225,6 +230,25 @@ class Canvas(QtWidgets.QWidget):
 
         self.prevMovePoint = pos
         self.restoreCursor()
+
+        # スケールバーモード時のカーソル処理
+        if self.scale_mode:
+            # 現在位置を記録
+            self.current_cursor_pos = pos
+            
+            # カーソルを強制的に十字に設定（マウスがウィンドウに入った直後のための対策）
+            if self._cursor != QtCore.Qt.CrossCursor:
+                self.setCursor(QtCore.Qt.CrossCursor)
+            
+            # マウス位置が変化したら画面を更新
+            # 過剰な更新を避けるために実際に変化がある場合のみ更新
+            if not hasattr(self, '_last_cursor_pos') or \
+               (abs(self._last_cursor_pos.x() - pos.x()) > 1 or \
+                abs(self._last_cursor_pos.y() - pos.y()) > 1):
+                self._last_cursor_pos = pos
+                self.update()
+            
+            return
 
         # Polygon drawing.
         if self.drawing():
@@ -437,6 +461,23 @@ class Canvas(QtWidgets.QWidget):
             pos = self.transformPos(ev.localPos())
         else:
             pos = self.transformPos(ev.posF())
+            
+        # スケールバーモード時の処理
+        if self.scale_mode and ev.button() == QtCore.Qt.LeftButton:
+            # クリックした座標を保存
+            point = (pos.x(), pos.y())
+            if len(self.scale_points) < 2:
+                self.scale_points.append(point)
+                self.update()  # 画面を更新して点を表示
+                
+                # 2点目をクリックした後、アプリケーションにスケール値入力ダイアログを表示させる
+                if len(self.scale_points) == 2:
+                    # アプリケーションクラスのスケール値設定関数を呼び出す
+                    if self.app and hasattr(self.app, 'setScaleValue'):
+                        self.app.scale_points = self.scale_points
+                        self.app.setScaleValue()
+            return
+            
         if ev.button() == QtCore.Qt.LeftButton:
             if self.drawing():
                 if self.current:
@@ -667,15 +708,16 @@ class Canvas(QtWidgets.QWidget):
                 self.prevPoint = pos
                 self.repaint()
 
-        # elif ev.button() == QtCore.Qt.RightButton and self.editing():
-        #     group_mode = int(ev.modifiers()) == QtCore.Qt.ControlModifier
-        #     if not self.selectedShapes or (
-        #         self.hShape is not None
-        #         and self.hShape not in self.selectedShapes
-        #     ):
-        #         self.selectShapePoint(pos, multiple_selection_mode=group_mode)
-        #         self.repaint()
-        #     self.prevPoint = pos
+        if self.movingShape and self.hShape:
+            index = self.shapes.index(self.hShape)
+            if (
+                self.shapesBackups[-1][index].points
+                != self.shapes[index].points
+            ):
+                self.storeShapes()
+                self.shapeMoved.emit()
+
+            self.movingShape = False
 
     def mouseReleaseEvent(self, ev):
         if ev.button() == QtCore.Qt.RightButton:
@@ -736,8 +778,64 @@ class Canvas(QtWidgets.QWidget):
             self.update()
 
     def setHiding(self, enable=True):
-        self._hideBackround = self.hideBackround if enable else False
+        self._hideBackround = enable
 
+    def set_scale_mode(self, enable=True):
+        """スケールバーモードを設定する"""
+        # 現在の状態を保存（スケールモード開始時）
+        # これはモードを切り替える前に行う必要がある
+        if enable and not self.scale_mode:
+            # 現在の描画状態を保存
+            self._prev_mode_state = {
+                'hideBackround': self._hideBackround,
+                'cursor': self._cursor,
+                'selected_shapes': [s for s in self.selectedShapes],
+            }
+        
+        # モード切替
+        self.scale_mode = enable
+        self.scale_points = []  # ポイントをリセット
+        
+        # カーソル位置追跡の初期化
+        if hasattr(self, 'current_cursor_pos'):
+            del self.current_cursor_pos
+        if hasattr(self, '_last_cursor_pos'):
+            del self._last_cursor_pos
+        
+        if enable:
+            # スケールモード開始時の処理
+            self.setCursor(QtCore.Qt.CrossCursor)  # 十字カーソルに変更
+            # 一時的に選択解除して描画状態をクリアに
+            if self.selectedShapes:
+                self.deSelectShape()
+        else:
+            # スケールモード終了時の処理
+            self.restoreCursor()
+            
+            # 保存した状態を復元
+            if hasattr(self, '_prev_mode_state'):
+                # 描画状態の復元
+                self._hideBackround = self._prev_mode_state['hideBackround']
+                
+                # 選択状態の復元（必要に応じて）
+                if self._prev_mode_state['selected_shapes']:
+                    self.selectShapes(self._prev_mode_state['selected_shapes'])
+                
+                # 状態復元後にクリア
+                del self._prev_mode_state
+            else:
+                # 保存した状態がない場合のフォールバック
+                self._hideBackround = False
+            
+            # マスク描画が確実に行われるよう処理を追加
+            # より長い遅延を設定し、複数回の更新を確実に行う
+            QtCore.QTimer.singleShot(50, self.update)
+            QtCore.QTimer.singleShot(150, self.update)
+            QtCore.QTimer.singleShot(300, self.update)
+        
+        # 画面を即時更新
+        self.update()
+    
     def canCloseShape(self):
         return self.drawing() and self.current and len(self.current) > 2
 
@@ -895,6 +993,48 @@ class Canvas(QtWidgets.QWidget):
 
         p.drawPixmap(0, 0, self.pixmap)
 
+        # スケールバーモード時の描画
+        if self.scale_mode:
+            # スケールポイントの描画
+            if self.scale_points:
+                p.setPen(QtGui.QPen(QtGui.QColor(255, 0, 0), 2))
+                p.setBrush(QtGui.QBrush(QtGui.QColor(255, 0, 0, 128)))
+                
+                # 各ポイントを描画
+                for point in self.scale_points:
+                    x, y = point
+                    # 小さな四角を描画 - 浮動小数点を整数に変換
+                    p.drawRect(int(x - 3), int(y - 3), 6, 6)
+                
+                # 2点間に線を描画
+                if len(self.scale_points) == 2:
+                    p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 0), 2, QtCore.Qt.DashLine))
+                    x1, y1 = self.scale_points[0]
+                    x2, y2 = self.scale_points[1]
+                    p.drawLine(int(x1), int(y1), int(x2), int(y2))
+                    
+                    # 距離を計算して表示
+                    distance = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                    mid_x = (x1 + x2) / 2
+                    mid_y = (y1 + y2) / 2
+                    p.setPen(QtGui.QColor(255, 255, 255))
+                    p.setFont(QtGui.QFont("Arial", 10))
+                    p.drawText(int(mid_x), int(mid_y - 5), f"{distance:.1f} px")
+            
+            # カスタムカーソルの描画（現在のマウス位置に小さな四角と十字線）
+            if hasattr(self, 'current_cursor_pos'):
+                pos = self.current_cursor_pos
+                p.setPen(QtGui.QPen(QtGui.QColor(0, 255, 0), 1))
+                p.setBrush(QtGui.QBrush(QtGui.QColor(0, 255, 0, 100)))
+                
+                # 小さな四角を描画 - 浮動小数点を整数に変換
+                p.drawRect(int(pos.x() - 3), int(pos.y() - 3), 6, 6)
+                
+                # 十字線を描画 - 浮動小数点を整数に変換
+                cursor_length = 15  # 十字線の長さ
+                p.drawLine(int(pos.x()), int(pos.y() - cursor_length), int(pos.x()), int(pos.y() + cursor_length))
+                p.drawLine(int(pos.x() - cursor_length), int(pos.y()), int(pos.x() + cursor_length), int(pos.y()))
+
         # draw crosshair
         if (
             self._crosshair[self._createMode]
@@ -918,9 +1058,10 @@ class Canvas(QtWidgets.QWidget):
 
         Shape.scale = self.scale
         for shape in self.shapes:
-            if (shape.selected or not self._hideBackround) and self.isVisible(
-                shape
-            ):
+            # if (shape.selected or not self._hideBackround) and self.isVisible(
+            #     shape
+            # ):
+            if self.isVisible(shape):
                 shape.fill = shape.selected or shape == self.hShape
                 shape.paint(p)
         if self.current:
@@ -946,11 +1087,33 @@ class Canvas(QtWidgets.QWidget):
             drawing_shape.fill = True
             drawing_shape.paint(p)
         
-        if len(self.app.sam_mask) > 0:
+        # SAMマスクの描画 - より確実に描画されるように改善
+        if hasattr(self.app, 'sam_mask') and len(self.app.sam_mask) > 0:
+            # マスク数の確認（デバッグ用）
+            # print(f"Drawing {len(self.app.sam_mask)} masks") 
+            
+            # 描画設定 - グローバル設定
+            p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+            
+            # 各マスクを個別に描画
             for tmp_mask in self.app.sam_mask:
                 drawing_shape = tmp_mask.copy()
+                
+                # マスク表示設定
                 drawing_shape.fill = True
+                drawing_shape.line_color = QtGui.QColor(30, 30, 200, 200)  # 青色ベース
+                
+                # 線スタイル設定
+                line_pen = QtGui.QPen(drawing_shape.line_color)
+                line_pen.setWidth(max(2, int(round(2.0 / self.scale))))
+                
+                # 塗りつぶし色設定
+                fill_color = QtGui.QColor(30, 30, 200, 100)  # 半透明の青色
+                
+                # 描画実行
                 drawing_shape.paint(p, proposal_flag=1)
+        
         p.end()
 
     def transformPos(self, point):

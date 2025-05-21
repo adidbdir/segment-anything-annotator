@@ -68,6 +68,17 @@ class MainWindow(QMainWindow):
         self.keep_input_size = keep_input_size
         self.max_size = float(max_size)
         self.category_file = category_file
+        self.global_w = global_w
+        self.global_h = global_h
+
+        # スケールバー関連の変数を初期化
+        self.scale_mode = False  # スケールバー測定モード
+        self.scale_points = []  # スケールバーの2点の座標
+        self.scale_value = 0.0  # スケールの実際の長さ
+        self.scale_unit = "μm"  # スケールの単位
+        self.scale_factor = 1.0  # ピクセルから実際の長さへの変換係数
+        self.scalebar_image = None  # スケールバー画像へのパス
+        self.scale_set = False  # スケールが設定されたかどうか
 
         self.setWindowTitle('segment-anything-annotator')
         self.canvas = Canvas(self,
@@ -534,7 +545,7 @@ class MainWindow(QMainWindow):
                         # print(f"カテゴリファイルを読み込みました: {self.category_file}")
                         self.clickLoadSAM()
                     else:
-                                self.default_label = None  # 複数の場合はNoneに設定
+                        self.default_label = None  # 複数の場合はNoneに設定
             except Exception as e:
                 print(f"カテゴリファイルの読み込みに失敗しました: {e}")
         
@@ -555,6 +566,22 @@ class MainWindow(QMainWindow):
         # チェックボックスの配置
         self.save_mask_checkbox.move(int(0.01 * global_w), int(0.95 * global_h))
         self.save_bbox_checkbox.move(int(0.20 * global_w), int(0.95 * global_h))
+        
+        # スケールバー測定関連のUIコンポーネント
+        self.scale_button = QPushButton('スケールバー測定', self)
+        self.scale_button.clicked.connect(self.startScaleBarMode)
+        self.scale_button.move(int(0.40 * global_w), int(0.95 * global_h))
+        self.scale_button.resize(int(0.15 * global_w), int(0.03 * global_h))
+        
+        self.scale_status_label = QLabel("スケール: 未設定", self)
+        self.scale_status_label.move(int(0.56 * global_w), int(0.95 * global_h))
+        self.scale_status_label.resize(int(0.2 * global_w), int(0.03 * global_h))
+        
+        # スケールバー画像を自動的に探して表示するボタン
+        self.find_scalebar_button = QPushButton('スケールバー画像を検索', self)
+        self.find_scalebar_button.clicked.connect(self.findScaleBarImage)
+        self.find_scalebar_button.move(int(0.77 * global_w), int(0.95 * global_h))
+        self.find_scalebar_button.resize(int(0.2 * global_w), int(0.03 * global_h))
     
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
@@ -586,35 +613,6 @@ class MainWindow(QMainWindow):
             self.saveMaskAndBBoxImages(filename_base)
 
             self.setClean()
-
-    # def saveFileAs(self, _value=False):
-    #     assert not self.image.isNull(), "cannot save empty image"
-    #     self._saveFile(self.saveFileDialog())
-
-    # def saveFile(self, _value=False):
-    #     assert not self.image.isNull(), "cannot save empty image"
-    #     if self.labelFile:
-    #         # DL20180323 - overwrite when in directory
-    #         self._saveFile(self.labelFile.filename)
-    #     elif self.output_file:
-    #         self._saveFile(self.output_file)
-    #         self.close()
-    #     else:
-    #         self._saveFile(self.saveFileDialog())
-    #     self._saveFile(self.saveFileDialog())
-    #     print(self.current_output_filename)
-    #     results, experiment_params, output_dir = self.exportCSVResults()
-    #     if results is not None and experiment_params is not None and output_dir is not None:
-    #         csv_exporter.export_csv(results, experiment_params, output_dir)
-    #         self._saveFile(self.current_output_filename)
-    #     else:
-    #         # エラーメッセージは既に exportCSVResults 内で表示されているので、ここでは何もしない
-    #         pass
-    #     self._saveFile(self.current_output_filename)
-
-    # def _saveFile(self, filename):
-    #     if filename and self.saveLabels(filename):
-    #         self.setClean()
 
     def updateSaveMaskSetting(self, state):
         self.save_mask = (state == Qt.Checked)
@@ -834,7 +832,16 @@ class MainWindow(QMainWindow):
         self.current_img = self.img_list[self.current_img_index]
         self.img_progress_bar.setMinimum(0)
         self.img_progress_bar.setMaximum(self.img_len-1)
+        
         self.loadImg()
+        # ディレクトリ選択後、スケールが未設定ならスケールバー設定処理を開始
+        if not self.scale_set:
+            # スケールバー画像を検索して表示
+            found = self.findScaleBarImage()
+            if found:
+                # スケールバー測定モードを開始
+                self.startScaleBarMode()
+
 
     def clickSaveChoose(self):
         directory = QFileDialog.getExistingDirectory(self, 'choose target fold','.')
@@ -855,6 +862,123 @@ class MainWindow(QMainWindow):
             self.class_on_flag = True
             self.class_on_text.setText('Class On')
 
+    # スケールバー測定関連の関数
+    def startScaleBarMode(self):
+        """スケールバー測定モードを開始する"""
+        # すでにスケールバー画像が読み込まれているか確認
+        if self.scalebar_image is None:
+            # スケールバー画像を自動検索
+            self.findScaleBarImage()
+            if self.scalebar_image is None:
+                # スケールバー画像が見つからなかった場合、メッセージボックスを表示
+                QMessageBox.warning(self, "警告", "スケールバー画像が見つかりませんでした。\n"
+                                  "画像フォルダに'scalebar'または'scale'を含む名前の画像を配置してください。")
+                return
+
+        # スケールバー測定モードに入る
+        self.scale_mode = True
+        self.scale_points = []  # ポイントをリセット
+        self.canvas.set_scale_mode(True)  # キャンバスにスケールモードを通知
+
+        # ユーザーに指示を表示
+        # QMessageBox.information(self, "スケールバー測定", "スケールバーの開始点と終了点を順番にクリックしてください。\n"
+        #                        "スケールバーの実際の長さを入力するダイアログが表示されます。")
+
+    def findScaleBarImage(self):
+        """フォルダ内からスケールバー画像を探して読み込む"""
+        if not self.img_list:
+            QMessageBox.warning(self, "警告", "画像フォルダが選択されていません。\n"
+                              "まず画像フォルダを選択してください。")
+            return
+
+        # フォルダ内のすべての画像をチェック
+        img_dir = os.path.dirname(self.img_list[0])
+        scalebar_candidates = []
+        
+        for img_path in glob.glob(img_dir + '/*.jpg') + glob.glob(img_dir + '/*.png'):
+            img_filename = os.path.basename(img_path).lower()
+            # 「スケールバー」または「scalebar」、「scale」を含むファイル名を探す
+            if 'scalebar' in img_filename or 'scale' in img_filename or 'スケール' in img_filename:
+                scalebar_candidates.append(img_path)
+        
+        if scalebar_candidates:
+            # 最初に見つかったスケールバー画像を使用
+            self.scalebar_image = scalebar_candidates[0]
+            # スケールバー画像を読み込んで表示
+            self.current_img = self.scalebar_image
+            self.loadImg()
+            # QMessageBox.information(self, "スケールバー画像", f"スケールバー画像を読み込みました: {os.path.basename(self.scalebar_image)}")
+            return True
+        else:
+            self.scalebar_image = None
+            return False
+
+    def setScaleValue(self):
+        """スケールバーの実際の長さを設定するダイアログを表示"""
+        if len(self.scale_points) != 2:
+            QMessageBox.warning(self, "警告", "スケールバーの2点が指定されていません。")
+            return
+        
+        # 単位選択用のコンボボックス付きのダイアログを作成
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("スケール設定")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        
+        # 値入力用のウィジェット
+        form_layout = QtWidgets.QFormLayout()
+        scale_value_edit = QtWidgets.QLineEdit()
+        scale_value_edit.setValidator(QtGui.QDoubleValidator(0, 1000000, 5))  # 正の浮動小数点数のみ
+        
+        # 単位選択用のコンボボックス
+        unit_combo = QtWidgets.QComboBox()
+        unit_combo.addItems(["mm", "μm", "nm", "cm", "m"])
+        
+        form_layout.addRow("測定値:", scale_value_edit)
+        form_layout.addRow("単位:", unit_combo)
+        layout.addLayout(form_layout)
+        
+        # ボタン
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(button_box)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        
+        # ダイアログを表示
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            try:
+                scale_value = float(scale_value_edit.text())
+                scale_unit = unit_combo.currentText()
+                
+                # 2点間の距離（ピクセル）を計算
+                p1, p2 = self.scale_points
+                pixel_distance = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+                
+                # スケール係数を計算（実際の長さ/ピクセル数）
+                self.scale_factor = scale_value / pixel_distance
+                self.scale_value = scale_value
+                self.scale_unit = scale_unit
+                self.scale_set = True
+                
+                # ステータス表示を更新
+                self.scale_status_label.setText(f"スケール: {self.scale_factor:.6f} {scale_unit}/px")
+                
+                # スケールモードを終了
+                self.scale_mode = False
+                self.canvas.set_scale_mode(False)
+                
+                # 強制的に描画を更新し、マスクが表示されるようにする
+                self.canvas.update()
+                QtWidgets.QApplication.processEvents()  # イベントループを処理
+                
+                # 最初の画像に戻る（存在する場合）
+                if self.img_len > 0:
+                    self.current_img_index = 0
+                    self.current_img = self.img_list[self.current_img_index]
+                    self.loadImg()
+                
+            except ValueError:
+                QMessageBox.warning(self, "エラー", "有効な数値を入力してください。")
+
     def showExperimentParamsDialog(self):
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(self.tr("Experiment Parameters"))
@@ -870,6 +994,11 @@ class MainWindow(QMainWindow):
         suspension_density_edit = QtWidgets.QLineEdit(self.suspension_density_edit.text())
         image_scaler_edit = QtWidgets.QLineEdit(self.image_scaler_edit.text())
         
+        # スケール情報表示フィールドを追加
+        scale_info = f"{self.scale_factor:.6f} {self.scale_unit}/px" if self.scale_set else "未設定"
+        scale_info_label = QtWidgets.QLabel(scale_info)
+        scale_info_label.setStyleSheet("font-weight: bold;")
+        
         form_layout.addRow(self.tr("日付:"), date_edit)
         form_layout.addRow(self.tr("実験者:"), experimenter_edit)
         form_layout.addRow(self.tr("夾雑イオン種類:"), impurity_type_edit)
@@ -878,6 +1007,7 @@ class MainWindow(QMainWindow):
         form_layout.addRow(self.tr("晶析時間:"), crystal_time_edit)
         form_layout.addRow(self.tr("懸濁密度:"), suspension_density_edit)
         form_layout.addRow(self.tr("画像のスケーラー:"), image_scaler_edit)
+        form_layout.addRow(self.tr("スケール設定:"), scale_info_label)
         
         # OK/Cancel ボタン
         button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -1102,7 +1232,6 @@ class MainWindow(QMainWindow):
             if msk_idx == target_idx:
                 self.sam_mask = tmp_sam_mask
             self.sam_mask_proposal.append(tmp_sam_mask)
-            
     
     def addSamMask(self):
         if len(self.sam_mask) > 0:
@@ -1122,19 +1251,36 @@ class MainWindow(QMainWindow):
                 label = 'Object'
             if type(group_id) != int:
                 group_id=self.getMaxId() + 1
+            
+            # 各マスクにラベルとグループIDを設定してaddLabelで追加
             for sam_mask in self.sam_mask:
                 sam_mask.label = label
                 sam_mask.group_id = group_id
                 self.addLabel(sam_mask)
-        self.canvas.currentBox = None
-        self.canvas.currentPos = None
-        self.canvas.currentNeg = None
-        self.sam_mask = []
-        self.sam_mask_proposal = []
-        self.show_proposals()
-        self.canvas.loadShapes([item.shape() for item in self.labelList])
-        self.actions.save.setEnabled(True)
-        self.actions.editMode.setEnabled(True)
+            
+            # 現在の入力状態をクリア
+            self.canvas.currentBox = None
+            self.canvas.currentPos = None
+            self.canvas.currentNeg = None
+            
+            # プロポーザルをクリア
+            self.show_proposals()
+            
+            # ここでは sam_mask はクリアせず、最後に一括でクリアする
+            # まずshapesに追加されたマスクをキャンバスにロード
+            self.canvas.loadShapes([item.shape() for item in self.labelList])
+            
+            # UIの状態を更新
+            self.actions.save.setEnabled(True)
+            self.actions.editMode.setEnabled(True)
+            
+            # マスク表示確認のための強制描画更新
+            self.canvas.update()
+            QtWidgets.QApplication.processEvents()
+            
+            # マスク情報をクリア（描画が確実に行われた後）
+            self.sam_mask = []
+            self.sam_mask_proposal = []
 
 
 
@@ -1940,7 +2086,7 @@ class MainWindow(QMainWindow):
             return
         
         # 画像ファイル名
-        image_filename = os.path.basename(self.current_img)
+        image_filename = self.current_img
         
         # スケーリング係数を取得
         scale = float(self.image_scaler_edit.text() or "1.0")
@@ -2297,55 +2443,6 @@ class MainWindow(QMainWindow):
         image_basename = os.path.basename(self.current_img)
         filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz.png")
         cv2.imwrite(filename, cv2.cvtColor(visualization_img, cv2.COLOR_RGB2BGR))
-        
-        # 結果表示をPyQtのQPixmapを使って行う
-        try:
-            # PyQtで可視化画像を表示するダイアログを作成
-            vis_dialog = QtWidgets.QDialog(self)
-            vis_dialog.setWindowTitle("Secondary Mask & L Visualization")
-            
-            # レイアウトの設定
-            layout = QtWidgets.QVBoxLayout(vis_dialog)
-            
-            # QPixmapに変換
-            height, width = visualization_img.shape[:2]
-            bytes_per_line = 3 * width
-            q_img = QtGui.QImage(
-                visualization_img.data, 
-                width, 
-                height, 
-                bytes_per_line, 
-                QtGui.QImage.Format_RGB888
-            )
-            pixmap = QtGui.QPixmap.fromImage(q_img)
-            
-            # 表示サイズに合わせてスケーリング
-            scaled_pixmap = pixmap.scaled(
-                800, 
-                600, 
-                QtCore.Qt.KeepAspectRatio, 
-                QtCore.Qt.SmoothTransformation
-            )
-            
-            # ラベルに画像をセット
-            image_label = QtWidgets.QLabel()
-            image_label.setPixmap(scaled_pixmap)
-            layout.addWidget(image_label)
-            
-            # 情報テキスト
-            info_text = QtWidgets.QLabel(f"画像を {filename} に保存しました")
-            layout.addWidget(info_text)
-            
-            # OKボタン
-            ok_button = QtWidgets.QPushButton("OK")
-            ok_button.clicked.connect(vis_dialog.accept)
-            layout.addWidget(ok_button)
-            
-            # ダイアログを表示
-            vis_dialog.exec_()
-        except Exception as e:
-            # GUIエラーが発生した場合は単純にメッセージボックスを表示
-            QMessageBox.information(self, "保存完了", f"可視化画像を {filename} に保存しました")
 
 def get_parser():
     parser = argparse.ArgumentParser(description="pixel annotator by GroundedSAM")

@@ -138,19 +138,26 @@ class Shape(object):
             color = (
                 self.select_line_color if self.selected else self.line_color
             )
+            
+            # SAMマスク描画モード（proposal_flag = 1）の特別処理
             if proposal_flag == 1:
-                color = (
-                    QtGui.QColor(30, 30, 200)
-                )
+                color = QtGui.QColor(30, 30, 200)  # 青色ベース
+            
             pen = QtGui.QPen(color)
-            npen = QtGui.QPen(self.nvertex_fill_color)
-            if flag == 1:
-                # Try using integer sizes for smoother drawing(?)
-                pen.setWidth(max(1, int(round(2.0 / self.scale))))
-                painter.setPen(pen)
-            else:
+            
+            # 通常描画とネガティブポイント描画で異なるペンを使用
+            if flag == 0:  # ネガティブポイント描画
+                npen = QtGui.QPen(self.nvertex_fill_color)
                 npen.setWidth(max(1, int(round(2.0 / self.scale))))
                 painter.setPen(npen)
+            else:  # 通常描画
+                pen.setWidth(max(1, int(round(2.0 / self.scale))))
+                
+                # マスク描画モードではより明確な線スタイルを使用
+                if proposal_flag == 1:
+                    pen.setStyle(QtCore.Qt.SolidLine)
+                
+                painter.setPen(pen)
 
             line_path = QtGui.QPainterPath()
             vrtx_path = QtGui.QPainterPath()
@@ -200,9 +207,8 @@ class Shape(object):
                     else self.fill_color
                 )
                 if proposal_flag == 1:
-                    color = (
-                        QtGui.QColor(30, 30, 200,100)
-                    )
+                    # マスク描画用の半透明の塗りつぶし色
+                    color = QtGui.QColor(30, 30, 200, 100)
                 painter.fillPath(line_path, color)
             if proposal_flag == 0:
                 cx, cy = self.get_center_points(self.points)
