@@ -948,6 +948,7 @@ class MainWindow(QMainWindow):
         # 単位選択用のコンボボックス
         unit_combo = QtWidgets.QComboBox()
         unit_combo.addItems(["mm", "μm", "nm", "cm", "m"])
+        unit_combo.setCurrentText("μm") # 初期値を "μm" に設定
         
         form_layout.addRow("測定値:", scale_value_edit)
         form_layout.addRow("単位:", unit_combo)
@@ -994,6 +995,17 @@ class MainWindow(QMainWindow):
                 
             except ValueError:
                 QMessageBox.warning(self, "エラー", "有効な数値を入力してください。")
+                # Reset scale points and related canvas state
+                self.scale_points = []
+                if hasattr(self.canvas, 'scale_points'):
+                    self.canvas.scale_points = [] # Clear points in canvas as well
+                self.canvas.update() # Force repaint to clear the drawn points/line
+        else: # Dialog was cancelled or closed
+            # Reset scale points and related canvas state
+            self.scale_points = []
+            if hasattr(self.canvas, 'scale_points'):
+                self.canvas.scale_points = []
+            self.canvas.update() # Force repaint to clear the drawn points/line
 
     def showExperimentParamsDialog(self):
         dialog = QtWidgets.QDialog(self)
@@ -1086,22 +1098,74 @@ class MainWindow(QMainWindow):
             if len(img.shape) == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            for msk_idx in range(masks.shape[0]):
-                tmp_mask = masks[msk_idx]
-                tmp_vis = img.copy()
-                tmp_vis[tmp_mask > 0] = 0.5 * tmp_vis[tmp_mask > 0] + 0.5 * np.array([30,30,220])
-                tmp_vis = cv2.resize(tmp_vis,(int(0.17 * global_w),int(0.14 * global_h)))
-                tmp_vis = tmp_vis.astype(np.uint8)
-                pixmap = QPixmap.fromImage(QImage(tmp_vis, tmp_vis.shape[1], tmp_vis.shape[0], tmp_vis.shape[1] * 3 , QImage.Format_RGB888))
-                #self.button_proposal_list[msk_idx].setPixmap(pixmap)
-                self.button_proposal_list[msk_idx].setIcon(QIcon(pixmap))
-                self.button_proposal_list[msk_idx].setIconSize(QSize(tmp_vis.shape[1], tmp_vis.shape[0]))
-                self.button_proposal_list[msk_idx].setShortcut(str(msk_idx+1))
-        else:
+            
+            # Get button dimensions once, assuming all proposal buttons are the same size
+            # If they can be different, this should be inside the loop
+            if not self.button_proposal_list:
+                return
+            button_width = self.button_proposal_list[0].width()
+            button_height = self.button_proposal_list[0].height()
+
+            for msk_idx in range(masks.shape[0]): # Iterate through each mask proposal
+                if msk_idx >= len(self.button_proposal_list): # Don't exceed available buttons
+                    break
+
+                current_button = self.button_proposal_list[msk_idx]
+                tmp_mask_slice = masks[msk_idx] # This is a single mask (H, W)
+                tmp_vis_for_button = img.copy()
+
+                # Apply mask overlay to tmp_vis_for_button
+                # Ensure tmp_mask_slice is boolean
+                bool_mask_slice = tmp_mask_slice.astype(bool)
+
+                # Overlay requires the mask to be broadcastable to the image's shape if image is 3-channel
+                # and mask is 2D. We stack the boolean mask to 3 channels.
+                if tmp_vis_for_button.ndim == 3 and bool_mask_slice.ndim == 2:
+                    if tmp_vis_for_button.shape[:2] == bool_mask_slice.shape:
+                        bool_mask_expanded = np.stack([bool_mask_slice]*3, axis=-1)
+                        tmp_vis_for_button = np.where(
+                            bool_mask_expanded,
+                            0.5 * tmp_vis_for_button + 0.5 * np.array([30,30,220]),
+                            tmp_vis_for_button
+                        ).astype(np.uint8)
+                    # else: print(f"Shape mismatch for overlay: img {tmp_vis_for_button.shape[:2]} mask {bool_mask_slice.shape}")
+                # else: print(f"Vis/Mask ndim issue: vis {tmp_vis_for_button.ndim}, mask {bool_mask_slice.ndim}")
+
+                # Resize the visualized image to fit the button, maintaining aspect ratio
+                img_h, img_w = tmp_vis_for_button.shape[:2]
+                if img_h == 0 or img_w == 0: continue # Skip if image is invalid
+
+                aspect_ratio = img_w / img_h
+                
+                target_w = button_width
+                target_h = int(target_w / aspect_ratio)
+
+                if target_h > button_height:
+                    target_h = button_height
+                    target_w = int(target_h * aspect_ratio)
+                
+                if target_w <= 0 or target_h <= 0: continue # Skip if dimensions are invalid
+
+                try:
+                    resized_vis = cv2.resize(tmp_vis_for_button, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                except cv2.error as e:
+                    # print(f"cv2.resize error: {e} with target_w={target_w}, target_h={target_h}")
+                    continue
+
+                q_image = QImage(resized_vis.data, resized_vis.shape[1], resized_vis.shape[0], resized_vis.strides[0], QImage.Format_RGB888)
+                pixmap = QPixmap.fromImage(q_image)
+                
+                current_button.setIcon(QIcon(pixmap))
+                current_button.setIconSize(QSize(target_w, target_h))
+                current_button.setText('') 
+                current_button.setShortcut(str(msk_idx+1))
+
+        else: # flag == 1 (clear proposals)
             for idx, button_proposal in enumerate(self.button_proposal_list):
-                button_proposal.setText('proprosal{}'.format(idx))
+                button_proposal.setIcon(QIcon()) # Clear icon
+                button_proposal.setText('proposal{}'.format(idx+1))
                 button_proposal.setIconSize(QSize(0,0))
-                self.button_proposal_list[idx].setShortcut(str(idx+1))
+                button_proposal.setShortcut(str(idx+1))
 
     def transform_input(self, image, box=None, points=None):
         if self.keep_input_size == True:
@@ -2257,7 +2321,7 @@ class MainWindow(QMainWindow):
         # 二次粒子情報を計算
         if secondary_obb:
             # 二次粒子のOBB頂点から長さを計算
-            secondary_points = np.array([[p.x(), p.y()] for p in secondary_obb])
+            secondary_points = np.array([[p.x(), p.y()] for p in secondary_obb.points])
             
             # OBBから長さを計算
             rect = cv2.minAreaRect(secondary_points.astype(np.float32))
@@ -2385,7 +2449,7 @@ class MainWindow(QMainWindow):
             # output_pixmap.save(color_mask_filename, "PNG")
             
             # 合成画像の保存
-            composite_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_composite.png")
+            composite_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_composite.jpg")
             cv2.imwrite(composite_filename, composite_img)
         
         # バウンディングボックス画像の作成
@@ -2417,7 +2481,7 @@ class MainWindow(QMainWindow):
                 cv2.putText(bbox_img, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
             # バウンディングボックス画像の保存
-            bbox_filename = os.path.join(bbox_dir, f"{os.path.basename(filename_base)}_bbox.png")
+            bbox_filename = os.path.join(bbox_dir, f"{os.path.basename(filename_base)}_bbox.jpg")
             cv2.imwrite(bbox_filename, cv2.cvtColor(bbox_img, cv2.COLOR_RGB2BGR))
 
     def deleteShape(self, shape):
@@ -2542,7 +2606,7 @@ class MainWindow(QMainWindow):
         os.makedirs(output_dir, exist_ok=True)
         
         image_basename = os.path.basename(self.current_img)
-        filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz.png")
+        filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz.jpg")
         cv2.imwrite(filename, cv2.cvtColor(visualization_img, cv2.COLOR_RGB2BGR))
 
     def update_area_threshold(self, value):
