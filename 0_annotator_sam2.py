@@ -17,7 +17,7 @@ import base64
 import csv
 import uuid
 
-from PyQt5.QtWidgets import QWidget, QApplication, QMainWindow, QApplication, QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, QScrollArea, QDockWidget, QMessageBox, QLineEdit, QCheckBox, QSpinBox
+from PyQt5.QtWidgets import QWidget, QApplication, QMainWindow, QApplication, QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, QScrollArea, QDockWidget, QMessageBox, QLineEdit, QCheckBox, QSpinBox, QDateEdit
 from PyQt5.QtGui import QPixmap, QIcon, QImage
 from PyQt5.Qt import QSize
 from qtpy.QtCore import Qt
@@ -1013,7 +1013,21 @@ class MainWindow(QMainWindow):
         form_layout = QtWidgets.QFormLayout(dialog)
         
         # ダイアログ用のローカルな入力欄を作成し，既存の隠し QLineEdit の内容で初期化
-        date_edit = QtWidgets.QLineEdit(self.date_edit.text())
+        date_edit = QtWidgets.QDateEdit()
+        date_edit.setDisplayFormat("yyyy/MM/dd")
+        date_edit.setCalendarPopup(True)  # カレンダーポップアップを有効化
+        date_edit.setDate(QtCore.QDate.currentDate())  # 現在の日付を初期値として設定
+        
+        # 既存の日付が設定されている場合は、それを表示
+        if self.date_edit.text():
+            try:
+                # 既存の日付文字列を解析して設定
+                existing_date = QtCore.QDate.fromString(self.date_edit.text(), "yyMMdd")
+                if existing_date.isValid():
+                    date_edit.setDate(existing_date)
+            except:
+                pass
+        
         experimenter_edit = QtWidgets.QLineEdit(self.experimenter_edit.text())
         impurity_type_edit = QtWidgets.QLineEdit(self.impurity_type_edit.text())
         impurity_conc_edit = QtWidgets.QLineEdit(self.impurity_conc_edit.text())
@@ -1034,8 +1048,8 @@ class MainWindow(QMainWindow):
         form_layout.addRow(self.tr("種晶の大きさ:"), seed_size_edit)
         form_layout.addRow(self.tr("晶析時間:"), crystal_time_edit)
         form_layout.addRow(self.tr("懸濁密度:"), suspension_density_edit)
-        form_layout.addRow(self.tr("画像のスケーラー:"), image_scaler_edit)
-        form_layout.addRow(self.tr("スケール設定:"), scale_info_label)
+        # form_layout.addRow(self.tr("画像のスケーラー:"), image_scaler_edit)
+        # form_layout.addRow(self.tr("スケール設定:"), scale_info_label)
         
         # OK/Cancel ボタン
         button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
@@ -1044,8 +1058,9 @@ class MainWindow(QMainWindow):
         button_box.rejected.connect(dialog.reject)
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            # ユーザー入力で更新された値を隠し QLineEdit に反映
-            self.date_edit.setText(date_edit.text())
+            # 日付を指定された形式（yyMMdd）で保存
+            formatted_date = date_edit.date().toString("yyMMdd")
+            self.date_edit.setText(formatted_date)
             self.experimenter_edit.setText(experimenter_edit.text())
             self.impurity_type_edit.setText(impurity_type_edit.text())
             self.impurity_conc_edit.setText(impurity_conc_edit.text())
