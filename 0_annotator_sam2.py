@@ -917,13 +917,23 @@ class MainWindow(QMainWindow):
             if 'scalebar' in img_filename or 'scale' in img_filename or 'スケール' in img_filename:
                 scalebar_candidates.append(img_path)
         
-        if scalebar_candidates:
+        if len(scalebar_candidates) > 1:
+            QMessageBox.critical(self, "エラー", "フォルダ内にスケールバー画像が複数見つかりました。\n1つにしてください。")
+            self.scalebar_image = None
+            return False
+        elif len(scalebar_candidates) == 1:
             # 最初に見つかったスケールバー画像を使用
             self.scalebar_image = scalebar_candidates[0]
+            # スケールバー画像をimg_listから除外
+            if self.scalebar_image in self.img_list:
+                self.img_list.remove(self.scalebar_image)
+                self.img_len = len(self.img_list)
+                # current_img_indexの調整
+                if self.current_img_index >= self.img_len:
+                    self.current_img_index = max(0, self.img_len - 1)
             # スケールバー画像を読み込んで表示
             self.current_img = self.scalebar_image
             self.loadImg()
-            # QMessageBox.information(self, "スケールバー画像", f"スケールバー画像を読み込みました: {os.path.basename(self.scalebar_image)}")
             return True
         else:
             self.scalebar_image = None
