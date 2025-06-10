@@ -1602,7 +1602,12 @@ class MainWindow(QMainWindow):
             text = items[0].data(Qt.UserRole)
         flags = {}
         group_id = None
-        if not text:
+        
+        # Manual Polygonの場合、デフォルトラベルを使用
+        if self.canvas.createMode == "polygon" and self.default_label:
+            text = self.default_label
+            group_id = self.getMaxId() + 1
+        elif not text:
             previous_text = self.labelDialog.edit.text()
             xx = self.labelDialog.popUp(text)
             if len(xx) == 4:
@@ -1624,6 +1629,11 @@ class MainWindow(QMainWindow):
             self.labelList.clearSelection()
             shape = self.canvas.setLastLabel(text, flags)
             shape.group_id = group_id
+            
+            # Manual Polygonで描画された場合、ポリゴンからマスクを生成
+            if self.canvas.createMode == "polygon" and shape.shape_type == "polygon":
+                self.generateMaskFromPolygon(shape)
+            
             self.addLabel(shape)
             self.actions.editMode.setEnabled(True)
             self.actions.undoLastPoint.setEnabled(False)
@@ -1754,6 +1764,31 @@ class MainWindow(QMainWindow):
             return contours
         else:
             return None
+
+    def generateMaskFromPolygon(self, shape):
+        """
+        Manual Polygonで描画された形状からマスクを生成し、original_sam_maskとして保存する
+        
+        Args:
+            shape: 描画された多角形のShapeオブジェクト
+        """
+        if not shape.points or len(shape.points) < 3:
+            return
+        
+        # 画像サイズを取得
+        if not hasattr(self, 'raw_h') or not hasattr(self, 'raw_w'):
+            return
+        
+        # ポリゴンの点を配列に変換
+        polygon_points = [[p.x(), p.y()] for p in shape.points]
+        
+        # polygon2maskメソッドを使用してマスクを生成
+        mask = self.polygon2mask(polygon_points, (self.raw_h, self.raw_w))
+        
+        # 生成したマスクをoriginal_sam_maskとして保存
+        setattr(shape, 'original_sam_mask', mask)
+        
+        print(f"Generated mask from manual polygon for {shape.label} (size: {mask.shape})")
 
     def editLabel(self, item=None):
         if item and not isinstance(item, LabelListWidgetItem):
