@@ -213,11 +213,11 @@ class MainWindow(QMainWindow):
         self.scrollArea.resize(int(0.75 * global_w), int(0.7 * global_h))
         self.shape_dock.move(int(0.79 * global_w), int(0.08 * global_h))
         self.shape_dock.resize(int(0.2 * global_w), int(0.7 * global_h))
-        self.button_next.move(int(0.18 * global_w), int(0.85 * global_h))
+        self.button_next.move(int(0.195 * global_w), int(0.85 * global_h))
         self.button_next.resize(int(0.1 * global_w),int(0.04 * global_h))
-        self.button_last.move(int(0.01 * global_w), int(0.85 * global_h))
+        self.button_last.move(int(0.025 * global_w), int(0.85 * global_h))
         self.button_last.resize(int(0.1 * global_w),int(0.04 * global_h))
-        self.class_on_text.move(int(0.01 * global_w), int(0.9 * global_h))
+        # self.class_on_text.move(int(0.01 * global_w), int(0.9 * global_h))
         self.img_progress_bar.move(int(0.01 * global_w), int(0.8 * global_h))
         self.img_progress_bar.resize(int(0.3 * global_w),int(0.04 * global_h))
         
@@ -553,7 +553,7 @@ class MainWindow(QMainWindow):
         
         # 保存設定の保持
         self.save_mask = save_mask
-        self.save_bbox = save_bbox
+        self.save_bbox = False  # bbox出力は無効化
         self.save_labels = save_labels
         
         # 保存設定用チェックボックス
@@ -562,7 +562,7 @@ class MainWindow(QMainWindow):
         self.save_mask_checkbox.stateChanged.connect(self.updateSaveMaskSetting)
         
         self.save_bbox_checkbox = QtWidgets.QCheckBox(self.tr("Save BBox Images"), self)
-        self.save_bbox_checkbox.setChecked(self.save_bbox)
+        self.save_bbox_checkbox.setChecked(False)  # bbox出力は無効化
         self.save_bbox_checkbox.stateChanged.connect(self.updateSaveBBoxSetting)
         
         # チェックボックスの配置
@@ -584,6 +584,13 @@ class MainWindow(QMainWindow):
         self.find_scalebar_button.clicked.connect(self.findScaleBarImage)
         self.find_scalebar_button.move(int(0.77 * global_w), int(0.95 * global_h))
         self.find_scalebar_button.resize(int(0.2 * global_w), int(0.03 * global_h))
+        
+        # 現在の画像ファイル名表示用ラベル
+        self.current_filename_label = QLabel("ファイル: 未選択", self)
+        self.current_filename_label.move(int(0.01 * global_w), int(0.89 * global_h))
+        self.current_filename_label.resize(int(0.3 * global_w), int(0.02 * global_h))
+        self.current_filename_label.setStyleSheet("font-size: 10px; font-weight: bold; color: #333; background-color: #f0f0f0; padding: 2px;")
+        self.current_filename_label.setAlignment(Qt.AlignCenter)
     
         # Add area threshold UI
         self.area_threshold = 100  # Default value
@@ -608,6 +615,19 @@ class MainWindow(QMainWindow):
         else:
             self.current_output_dir = self.base_output_dir
         os.makedirs(self.current_output_dir, exist_ok=True)
+
+    def updateFilenameLabel(self):
+        """現在の画像ファイル名をUIラベルに表示する"""
+        if self.current_img:
+            filename = os.path.basename(self.current_img)
+            # 画像のインデックス情報も含める
+            if self.img_len > 0:
+                display_text = f"ファイル: {filename} ({self.current_img_index + 1}/{self.img_len})"
+            else:
+                display_text = f"ファイル: {filename}"
+            self.current_filename_label.setText(display_text)
+        else:
+            self.current_filename_label.setText("ファイル: 未選択")
 
     def getOutputSubDir(self, subdir_name):
         """指定されたサブディレクトリの完全パスを取得する"""
@@ -637,14 +657,17 @@ class MainWindow(QMainWindow):
         
         if self.save_labels:
             self.saveLabels(filename)
-        # マスクとバウンディングボックス画像の保存
-        if self.save_mask or self.save_bbox:
+        # マスク画像の保存
+        if self.save_mask:
             filename_base = os.path.splitext(filename)[
                 0
             ]  # 拡張子を除いたファイル名
             self.saveMaskAndBBoxImages(filename_base)
-
-            self.setClean()
+        
+        # すべての二次粒子の可視化
+        self.visualizeAllSecondaryParticles()
+        
+        self.setClean()
 
     def updateSaveMaskSetting(self, state):
         self.save_mask = (state == Qt.Checked)
@@ -810,6 +833,9 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap(self.current_img)
         self.canvas.loadPixmap(pixmap)
         self.img_progress_bar.setValue(self.current_img_index)
+        
+        # ファイル名ラベルを更新
+        self.updateFilenameLabel()
 
         # 自動的にズームレベルを調整して画像全体を表示
         self.adjustZoomToFitImage()
@@ -872,6 +898,7 @@ class MainWindow(QMainWindow):
         self.img_progress_bar.setMaximum(self.img_len-1)
         
         self.loadImg()
+        
         # ディレクトリ選択後、スケールが未設定ならスケールバー設定処理を開始
         if not self.scale_set:
             # スケールバー画像を検索して表示
@@ -2159,8 +2186,8 @@ class MainWindow(QMainWindow):
         self.actions.save.setEnabled(True)  # 保存ボタンを有効化
         self.actions.editMode.setEnabled(True)  # 編集モードを有効化
 
-        # セカンダリーマスクとL値の可視化
-        self.visualizeSecondaryMaskAndL(secondary_shape, secondary_best_mask)
+        # セカンダリーマスクとL値の可視化（すべての二次粒子を可視化）
+        self.visualizeAllSecondaryParticles()
 
     def _convertPrimaryToOBB(self, segments):
         """
@@ -2298,7 +2325,7 @@ class MainWindow(QMainWindow):
             return
         
         # 画像ファイル名
-        image_filename = self.current_img
+        image_filename = os.path.basename(self.current_img)
         
         # スケーリング係数を取得
         scale = float(self.image_scaler_edit.text() or "1.0")
@@ -2436,97 +2463,107 @@ class MainWindow(QMainWindow):
 
         return None
 
+    def createMaskFromJsonData(self, shapes_data, img_shape, target_label=None):
+        """
+        JSONデータから直接マスク画像を生成する（領域を可視化）
+        
+        Args:
+            shapes_data: シェイプデータのリスト
+            img_shape: 画像のサイズ (height, width)
+            target_label: 対象とするラベル（"primary"/"secondary"など、Noneの場合は全て）
+        
+        Returns:
+            マスク画像（numpy配列）
+        """
+        height, width = img_shape[:2]
+        mask = np.zeros((height, width, 3), dtype=np.uint8)
+        
+        for shape_data in shapes_data:
+            if 'points' not in shape_data or not shape_data['points']:
+                continue
+            
+            # target_labelが指定されている場合、そのラベルのみを処理
+            if target_label and shape_data.get('label') != target_label:
+                continue
+                
+            # ポイントを numpy 配列に変換
+            points = np.array(shape_data['points'], dtype=np.int32)
+            
+            # グループIDから色を決定
+            group_id = shape_data.get('group_id', 0)
+            color_idx = int(group_id) if isinstance(group_id, int) else 0
+            color = LABEL_COLORMAP[color_idx % len(LABEL_COLORMAP)]
+            color = (int(color[0]), int(color[1]), int(color[2]))
+            
+            # ポリゴン領域を塗りつぶし
+            cv2.fillPoly(mask, [points], color)
+            
+            # 輪郭線を描画（より明確に）
+            cv2.polylines(mask, [points], isClosed=True, color=(255, 255, 255), thickness=2)
+        
+        return mask
+
     def saveMaskAndBBoxImages(self, filename_base):
         """
-        アノテーションデータに基づいてマスク画像とバウンディングボックス画像を保存する
+        JSONファイルのpointsからマスク画像を生成して保存する
         
         Args:
             filename_base: 保存するファイル名のベース部分（拡張子なし）
         """
-        if not self.canvas.shapes:
-            return  # 形状がない場合は何もしない
+        # JSONファイルが存在するかチェック
+        json_filename = filename_base + '.json' if not filename_base.endswith('.json') else filename_base
+        if not os.path.exists(json_filename):
+            return  # JSONファイルがない場合は何もしない
         
-        # 共通の出力ディレクトリ管理メソッドを使用
+        # JSONファイルからデータを読み込み
+        try:
+            with open(json_filename, 'r') as f:
+                data = json.load(f)
+            shapes_data = data.get('shapes', [])
+            if not shapes_data:
+                return  # シェイプデータがない場合は何もしない
+        except Exception as e:
+            print(f"Error loading JSON file: {e}")
+            return
+        
+        # マスク画像のみ保存（bbox出力は削除）
         if self.save_mask:
             mask_dir = self.getOutputSubDir("masks")
-        if self.save_bbox:
-            bbox_dir = self.getOutputSubDir("bbox")
-        
-        # 入力画像の読み込み
-        if hasattr(self, "image_np") and self.image_np is not None:
-            img = self.image_np.copy()
-        else:
-            img = cv2.imread(self.current_img)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        # マスク画像の作成と保存
-        if self.save_mask:
-            # canvas上の状態をそのままQPixmapにレンダリング
-            width = self.canvas.pixmap.width()
-            height = self.canvas.pixmap.height()
-            output_pixmap = self.canvas.renderToPixmap(width=width, height=height)
             
-            # QPixmapをQImageに変換
-            qimage = output_pixmap.toImage()
-            
-            # QImageをNumPy配列に変換
-            ptr = qimage.bits()
-            ptr.setsize(qimage.byteCount())
-            arr = np.array(ptr).reshape(height, width, 4)  # 4は、RGBAのバイト数
-            
-            # 元の画像を読み込んでリサイズ
+            # 元画像を読み込み
             original_img = cv2.imread(self.current_img)
-            original_img = cv2.resize(original_img, (width, height))
+            original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+            height, width = original_img.shape[:2]
             
-            # マスク画像（透明部分を除く）と元の画像を合成
-            alpha = arr[:, :, 3] / 255.0
-            alpha = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)  # 3チャンネル分に複製
+            # primaryとsecondaryのラベルそれぞれでマスク画像を生成
+            labels_to_process = ["primary", "secondary"]
             
-            # RGB順をBGR順に変換（cv2はBGR形式）
-            arr_bgr = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
-            
-            # 合成（マスクの不透明部分と元画像を混合）
-            composite_img = (arr_bgr * alpha + original_img * (1 - alpha)).astype(np.uint8)
-            
-            # # 純粋なマスク画像（塗りつぶし領域）も保存
-            # color_mask_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_mask_color.png")
-            # output_pixmap.save(color_mask_filename, "PNG")
-            
-            # 合成画像の保存
-            composite_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_composite.jpg")
-            cv2.imwrite(composite_filename, composite_img)
-        
-        # バウンディングボックス画像の作成
-        if self.save_bbox:
-            # 以下は既存のコードと同じ
-            bbox_img = img.copy()
-            
-            # 各形状のバウンディングボックスを描画
-            for shape in self.canvas.shapes:
-                points = np.array([[p.x(), p.y()] for p in shape.points], dtype=np.int32)
+            for label in labels_to_process:
+                # 指定ラベルのシェイプが存在するかチェック
+                label_shapes = [shape for shape in shapes_data if shape.get('label') == label]
+                if not label_shapes:
+                    continue  # 該当するラベルのシェイプがない場合はスキップ
                 
-                # バウンディングボックスを取得
-                x, y, w, h = cv2.boundingRect(points)
+                # JSONデータから指定ラベルのマスク画像を生成
+                mask_img = self.createMaskFromJsonData(shapes_data, (height, width), target_label=label)
                 
-                # 形状のラベルとグループID
-                label = shape.label
-                group_id = shape.group_id if shape.group_id is not None else "N/A"
+                # 合成画像の作成（元画像 + マスク画像）
+                # マスク領域の透明度を設定
+                alpha = 0.6
+                composite_img = original_img.copy()
                 
-                # 色の決定（グループIDに基づく）
-                color_idx = int(group_id) if isinstance(group_id, int) else 0
-                color = LABEL_COLORMAP[color_idx % len(LABEL_COLORMAP)]
-                color = (int(color[0]), int(color[1]), int(color[2]))
+                # マスクが存在する領域を見つける
+                mask_areas = np.any(mask_img > 0, axis=2)
                 
-                # バウンディングボックスを描画
-                cv2.rectangle(bbox_img, (x, y), (x + w, y + h), color, 2)
+                # マスクがある領域だけ合成
+                composite_img[mask_areas] = (
+                    alpha * mask_img[mask_areas] + 
+                    (1 - alpha) * original_img[mask_areas]
+                ).astype(np.uint8)
                 
-                # ラベルとグループIDを描画
-                text = f"{label} (ID:{group_id})"
-                cv2.putText(bbox_img, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # バウンディングボックス画像の保存
-            bbox_filename = os.path.join(bbox_dir, f"{os.path.basename(filename_base)}_bbox.jpg")
-            cv2.imwrite(bbox_filename, cv2.cvtColor(bbox_img, cv2.COLOR_RGB2BGR))
+                # 合成画像の保存（ラベル名を含むファイル名）
+                mask_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_{label}_mask.jpg")
+                cv2.imwrite(mask_filename, cv2.cvtColor(composite_img, cv2.COLOR_RGB2BGR))
 
     def deleteShape(self, shape):
         if shape in self.selectedShapes:
@@ -2536,19 +2573,42 @@ class MainWindow(QMainWindow):
         self.storeShapes()
         self.update()
 
-    def visualizeSecondaryMaskAndL(self, secondary_obb, secondary_mask):
+    def visualizeAllSecondaryParticles(self):
+        """
+        現在のcanvas上のすべての二次粒子を1枚の画像にまとめて可視化する
+        """
+        if not self.current_img:
+            return
+        
+        # canvas上のsecondaryラベルを持つ形状を見つける
+        secondary_shapes = [shape for shape in self.canvas.shapes if shape.label == 'secondary']
+        
+        if not secondary_shapes:
+            return
+        
+        # すべての二次粒子を1枚の画像にまとめて可視化
+        self.visualizeSecondaryMaskAndL(secondary_shapes, None, suffix="")
+
+    def visualizeSecondaryMaskAndL(self, secondary_shapes, secondary_mask, suffix=""):
         """
         secondaryマスクとL値（長軸・短軸）を可視化する
         
         Args:
-            secondary_obb: 二次粒子のOBB
-            secondary_mask: 二次粒子のマスク画像
+            secondary_shapes: 二次粒子のShapeオブジェクトのリストまたは単一のShapeオブジェクト
+            secondary_mask: 二次粒子のマスク画像（使用されない）
+            suffix: ファイル名に追加するサフィックス
         """
-        if secondary_obb is None or secondary_mask is None or not self.current_img:
-            QMessageBox.warning(self, "警告", "可視化するデータがありません")
+        if secondary_shapes is None or not self.current_img:
             return
         
-        # 元画像の読み込み
+        # 単一のShapeオブジェクトの場合はリストに変換
+        if not isinstance(secondary_shapes, list):
+            secondary_shapes = [secondary_shapes]
+        
+        if not secondary_shapes:
+            return
+        
+                # 元画像の読み込み
         original_img = cv2.imread(self.current_img)
         original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
         h, w = original_img.shape[:2]
@@ -2559,20 +2619,31 @@ class MainWindow(QMainWindow):
         # スケーリング係数を取得
         scale = float(self.image_scaler_edit.text() or "1.0")
         
-        # 1. マスクの可視化（半透明のオーバーレイ）
-        if isinstance(secondary_mask, np.ndarray) and secondary_mask.shape[:2] == (h, w):
-            # マスク領域を赤色で半透明にオーバーレイ
-            mask_overlay = visualization_img.copy()
-            mask_overlay[secondary_mask > 0] = np.array([255, 0, 0])  # 赤色
+        # 各二次粒子を処理
+        for i, secondary_shape in enumerate(secondary_shapes):
+            # Shapeオブジェクトから点を取得
+            points = np.array([[p.x(), p.y()] for p in secondary_shape.points], dtype=np.int32)
+            group_id = getattr(secondary_shape, 'group_id', 0)
+            
+            # 色を決定
+            color_idx = int(group_id) if isinstance(group_id, int) else 0
+            color = LABEL_COLORMAP[color_idx % len(LABEL_COLORMAP)]
+            mask_color = (int(color[0]), int(color[1]), int(color[2]))
+            
+            # 1. マスクの可視化（半透明のオーバーレイ）
+            # 単一の形状のマスクを生成
+            single_mask = np.zeros((h, w, 3), dtype=np.uint8)
+            cv2.fillPoly(single_mask, [points], mask_color)
             
             # 半透明合成
             alpha = 0.4  # 透明度
-            visualization_img = cv2.addWeighted(mask_overlay, alpha, visualization_img, 1 - alpha, 0)
-        
-        # 2. OBBの可視化と長軸・短軸の描画
-        if secondary_obb:
-            # OBBの頂点を取得（すでに存在する点を使用）
-            points = np.array([[p.x(), p.y()] for p in secondary_obb.points], dtype=np.int32)
+            mask_areas = np.any(single_mask > 0, axis=2)
+            visualization_img[mask_areas] = (
+                alpha * single_mask[mask_areas] + 
+                (1 - alpha) * visualization_img[mask_areas]
+            ).astype(np.uint8)
+            
+            # 2. OBBの可視化と長軸・短軸の描画
             
             # OBBを描画
             cv2.drawContours(visualization_img, [points], 0, (0, 255, 0), 2)
@@ -2582,74 +2653,76 @@ class MainWindow(QMainWindow):
             cy = np.mean(points[:, 1])
             
             # 対角点のペアを計算（0-2と1-3が対角）
-            diag1 = np.linalg.norm(points[0] - points[2])
-            diag2 = np.linalg.norm(points[1] - points[3])
-            
-            # 辺の長さを計算
-            edge1 = np.linalg.norm(points[0] - points[1])
-            edge2 = np.linalg.norm(points[1] - points[2])
-            
-            # 長軸と短軸の長さを特定
-            lmajor = max(edge1, edge2) * scale
-            lminor = min(edge1, edge2) * scale
-            
-            # 長軸と短軸のベクトルを計算
-            if edge1 > edge2:
-                # edge1が長軸の場合
-                major_vec = points[1] - points[0]
-                minor_vec = points[2] - points[1]
-            else:
-                # edge2が長軸の場合
-                major_vec = points[2] - points[1]
-                minor_vec = points[1] - points[0]
-            
-            # ベクトルの正規化
-            major_vec = major_vec / np.linalg.norm(major_vec) * max(edge1, edge2) / 2
-            minor_vec = minor_vec / np.linalg.norm(minor_vec) * min(edge1, edge2) / 2
-            
-            # 長軸の描画（赤い矢印）
-            start_major = (int(cx), int(cy))
-            end_major = (int(cx + major_vec[0]), int(cy + major_vec[1]))
-            cv2.arrowedLine(visualization_img, start_major, end_major, (255, 0, 0), 2)
-            
-            # 反対側の矢印も描画
-            end_major_opposite = (int(cx - major_vec[0]), int(cy - major_vec[1]))
-            cv2.arrowedLine(visualization_img, start_major, end_major_opposite, (255, 0, 0), 2)
-            
-            # 短軸の描画（青い矢印）
-            start_minor = (int(cx), int(cy))
-            end_minor = (int(cx + minor_vec[0]), int(cy + minor_vec[1]))
-            cv2.arrowedLine(visualization_img, start_minor, end_minor, (0, 0, 255), 2)
-            
-            # 反対側の矢印も描画
-            end_minor_opposite = (int(cx - minor_vec[0]), int(cy - minor_vec[1]))
-            cv2.arrowedLine(visualization_img, start_minor, end_minor_opposite, (0, 0, 255), 2)
-            
-            # L値のテキスト表示
-            cv2.putText(
-                visualization_img, 
-                f"Lmajor: {lmajor:.1f} um", 
-                (int(cx) + 20, int(cy) - 20), 
-                cv2.FONT_HERSHEY_SIMPLEX, 
-                0.7, 
-                (255, 0, 0), 
-                2
-            )
-            cv2.putText(
-                visualization_img, 
-                f"Lminor: {lminor:.1f} um", 
-                (int(cx) + 20, int(cy) + 10), 
-                cv2.FONT_HERSHEY_SIMPLEX, 
-                0.7, 
-                (0, 0, 255), 
-                2
-            )
+            if len(points) >= 4:  # OBBの場合のみ長軸・短軸を計算
+                diag1 = np.linalg.norm(points[0] - points[2])
+                diag2 = np.linalg.norm(points[1] - points[3])
+                
+                # 辺の長さを計算
+                edge1 = np.linalg.norm(points[0] - points[1])
+                edge2 = np.linalg.norm(points[1] - points[2])
+                
+                # 長軸と短軸の長さを特定
+                lmajor = max(edge1, edge2) * scale
+                lminor = min(edge1, edge2) * scale
+                
+                # 長軸と短軸のベクトルを計算
+                if edge1 > edge2:
+                    # edge1が長軸の場合
+                    major_vec = points[1] - points[0]
+                    minor_vec = points[2] - points[1]
+                else:
+                    # edge2が長軸の場合
+                    major_vec = points[2] - points[1]
+                    minor_vec = points[1] - points[0]
+                
+                # ベクトルの正規化
+                major_vec = major_vec / np.linalg.norm(major_vec) * max(edge1, edge2) / 2
+                minor_vec = minor_vec / np.linalg.norm(minor_vec) * min(edge1, edge2) / 2
+                
+                # 長軸の描画（赤い矢印）
+                start_major = (int(cx), int(cy))
+                end_major = (int(cx + major_vec[0]), int(cy + major_vec[1]))
+                cv2.arrowedLine(visualization_img, start_major, end_major, (255, 0, 0), 2)
+                
+                # 反対側の矢印も描画
+                end_major_opposite = (int(cx - major_vec[0]), int(cy - major_vec[1]))
+                cv2.arrowedLine(visualization_img, start_major, end_major_opposite, (255, 0, 0), 2)
+                
+                # 短軸の描画（青い矢印）
+                start_minor = (int(cx), int(cy))
+                end_minor = (int(cx + minor_vec[0]), int(cy + minor_vec[1]))
+                cv2.arrowedLine(visualization_img, start_minor, end_minor, (0, 0, 255), 2)
+                
+                # 反対側の矢印も描画
+                end_minor_opposite = (int(cx - minor_vec[0]), int(cy - minor_vec[1]))
+                cv2.arrowedLine(visualization_img, start_minor, end_minor_opposite, (0, 0, 255), 2)
+                
+                # L値のテキスト表示（各粒子に番号を付ける）
+                text_offset_y = i * 40  # 各粒子のテキストを縦にずらす
+                cv2.putText(
+                    visualization_img, 
+                    f"Lmajor: {lmajor:.1f} um", 
+                    (int(cx) + 20, int(cy) - 20 + text_offset_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.6, 
+                    (255, 0, 0), 
+                    2
+                )
+                cv2.putText(
+                    visualization_img, 
+                    f"Lminor: {lminor:.1f} um", 
+                    (int(cx) + 20, int(cy) + 10 + text_offset_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.6, 
+                    (0, 0, 255), 
+                    2
+                )
         
         # 共通の出力ディレクトリ管理メソッドを使用
         output_dir = self.getOutputSubDir("visualizations")
         
         image_basename = os.path.basename(self.current_img)
-        filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz.jpg")
+        filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz{suffix}.jpg")
         cv2.imwrite(filename, cv2.cvtColor(visualization_img, cv2.COLOR_RGB2BGR))
 
     def update_area_threshold(self, value):
@@ -2725,7 +2798,7 @@ def get_parser():
     parser.add_argument(
         "--save_bbox",
         action="store_true",
-        default=True,
+        default=False,
         help="Save bounding box visualization images"
     )
     parser.add_argument(
