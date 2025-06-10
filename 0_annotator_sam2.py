@@ -2226,6 +2226,9 @@ class MainWindow(QMainWindow):
         # セカンダリーマスクとL値の可視化（すべての二次粒子を可視化）
         self.visualizeAllSecondaryParticles()
 
+        # SAM2マスクをsecondary_shapeに保存
+        setattr(secondary_shape, 'original_sam_mask', secondary_best_mask)
+
     def _convertPrimaryToOBB(self, segments):
         """
         primaryセグメントをOBBに変換する
