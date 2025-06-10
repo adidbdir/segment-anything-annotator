@@ -68,11 +68,15 @@ def export_csv(results, experiment_params, output_dir):
     Args:
         results (list): 解析結果のリスト。各要素は辞書形式でフィールド名と値を持つ
         experiment_params (dict): 実験パラメータ情報の辞書
-        output_dir (str): 出力ディレクトリのパス
+        output_dir (str): 出力ディレクトリのパス（完全パス）
     """
     
     filename = construct_csv_filename(experiment_params)
     output_path = Path(output_dir)
+    
+    # 出力ディレクトリが存在しない場合は作成
+    output_path.mkdir(parents=True, exist_ok=True)
+    
     filepath = output_path / filename
     
     # ヘッダーフィールドの定義 - ふるい_500_,____.csv に合わせる

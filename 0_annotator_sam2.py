@@ -90,8 +90,9 @@ class MainWindow(QMainWindow):
 
         
         self._noSelectionSlot = False
-        self.current_output_dir = 'output'
-        os.makedirs(self.current_output_dir, exist_ok=True)
+        self.base_output_dir = 'output'  # ベース出力ディレクトリ
+        self.current_output_dir = 'output'  # 実際の出力ディレクトリ（入力フォルダ名含む）
+        os.makedirs(self.base_output_dir, exist_ok=True)
         self.current_output_filename = ''
         self.canvas.zoomRequest.connect(self.zoomRequest)
 
@@ -170,6 +171,7 @@ class MainWindow(QMainWindow):
         self.current_img_index = 0
         self.current_img = ''
         self.current_img_data = ''
+        self.input_folder_name = ''  # 入力フォルダ名を保存
 
         self.button_next = QPushButton('Next Image', self)
         self.button_next.clicked.connect(self.clickButtonNext)
@@ -599,6 +601,20 @@ class MainWindow(QMainWindow):
         self.area_threshold_spinbox.move(int(0.12 * global_w), int(0.92 * global_h)) # Adjust position
         self.area_threshold_spinbox.resize(int(0.07 * global_w), int(0.025 * global_h)) # Adjust size
 
+    def updateOutputDirectory(self):
+        """入力フォルダ名に基づいて出力ディレクトリを更新する"""
+        if self.input_folder_name:
+            self.current_output_dir = os.path.join(self.base_output_dir, self.input_folder_name)
+        else:
+            self.current_output_dir = self.base_output_dir
+        os.makedirs(self.current_output_dir, exist_ok=True)
+
+    def getOutputSubDir(self, subdir_name):
+        """指定されたサブディレクトリの完全パスを取得する"""
+        subdir_path = os.path.join(self.current_output_dir, subdir_name)
+        os.makedirs(subdir_path, exist_ok=True)
+        return subdir_path
+
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
         self._saveFile(self.saveFileDialog())
@@ -799,6 +815,7 @@ class MainWindow(QMainWindow):
         self.adjustZoomToFitImage()
 
         img_name = os.path.basename(self.current_img)[:-4]
+        # 共通の出力ディレクトリを使用してアノテーションファイルのパスを設定
         self.current_output_filename = osp.join(self.current_output_dir, img_name + '.json')
         self.labelList.clear()
         if os.path.isfile(self.current_output_filename):
@@ -838,6 +855,11 @@ class MainWindow(QMainWindow):
             directory = QFileDialog.getExistingDirectory(self, 'choose target fold','.')
         if directory == '':
             return
+        
+        # 入力フォルダ名を取得して保存し、出力ディレクトリを更新
+        self.input_folder_name = os.path.basename(directory)
+        self.updateOutputDirectory()
+        
         #self.img_list = glob.glob(directory + '/*.{jpg,png,JPG,PNG}')
         self.img_list = glob.glob(directory + '/*.jpg') + glob.glob(directory + '/*.png')
         self.img_list.sort()
@@ -864,8 +886,8 @@ class MainWindow(QMainWindow):
         if directory == '':
             return
         else:
-            self.current_output_dir = directory
-            os.makedirs(self.current_output_dir, exist_ok=True)
+            self.base_output_dir = directory
+            self.updateOutputDirectory()  # 入力フォルダ名を考慮して実際の出力ディレクトリを更新
             self.loadImg()
             return directory
 
@@ -2404,7 +2426,7 @@ class MainWindow(QMainWindow):
                 "image_scaler": self.image_scaler_edit.text(),
             }
             
-            # CSVにエクスポート
+            # CSVにエクスポート（共通の出力ディレクトリを使用）
             csv_path = csv_exporter.export_csv(all_particles, experiment_params, self.current_output_dir)
             work_dir = self.current_output_dir
             crystallization = CrystallizationAnalysis(
@@ -2424,14 +2446,11 @@ class MainWindow(QMainWindow):
         if not self.canvas.shapes:
             return  # 形状がない場合は何もしない
         
-        # 出力ディレクトリの作成
-        mask_dir = os.path.join(self.current_output_dir, "masks")
-        bbox_dir = os.path.join(self.current_output_dir, "bbox")
-        
+        # 共通の出力ディレクトリ管理メソッドを使用
         if self.save_mask:
-            os.makedirs(mask_dir, exist_ok=True)
+            mask_dir = self.getOutputSubDir("masks")
         if self.save_bbox:
-            os.makedirs(bbox_dir, exist_ok=True)
+            bbox_dir = self.getOutputSubDir("bbox")
         
         # 入力画像の読み込み
         if hasattr(self, "image_np") and self.image_np is not None:
@@ -2626,9 +2645,8 @@ class MainWindow(QMainWindow):
                 2
             )
         
-        # GUIウィンドウは使用せず、直接ファイルに保存
-        output_dir = os.path.join(self.current_output_dir, "visualizations")
-        os.makedirs(output_dir, exist_ok=True)
+        # 共通の出力ディレクトリ管理メソッドを使用
+        output_dir = self.getOutputSubDir("visualizations")
         
         image_basename = os.path.basename(self.current_img)
         filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz.jpg")
