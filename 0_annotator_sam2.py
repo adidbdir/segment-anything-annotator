@@ -504,8 +504,8 @@ class MainWindow(QMainWindow):
         self.toolbar.addAction(undo)
         self.toolbar.addAction(delete)
         self.toolbar.addAction(edit)
-        self.toolbar.addAction(duplicate)
-        self.toolbar.addAction(reduce_point)
+        # self.toolbar.addAction(duplicate)
+        # self.toolbar.addAction(reduce_point)
         self.toolbar.addAction(GroupSeg)
         self.toolbar.addAction(save)
         self.toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
@@ -680,16 +680,32 @@ class MainWindow(QMainWindow):
 
         def format_shape(s):
             data = s.other_data.copy()
-            data.update(
-                dict(
-                    label=s.label.encode("utf-8") if PY2 else s.label,
-                    points=[[p.x(), p.y()] for p in s.points],
-                    group_id=s.group_id,
-                    description="",
-                    shape_type=s.shape_type,
-                    flags=s.flags,
-                )
+            
+            # SAMマスクがある場合は、マスクから輪郭を抽出してpointsとして使用
+            if hasattr(s, 'original_sam_mask'):
+                # SAMマスクから輪郭を抽出
+                contours = self.mask2polygon(s.original_sam_mask)
+                if contours is not None and len(contours) > 0:
+                    # 最大の輪郭を使用
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    points = [[float(point[0][0]), float(point[0][1])] for point in largest_contour]
+                else:
+                    # 輪郭が見つからない場合は元のpointsを使用
+                    points = [[p.x(), p.y()] for p in s.points]
+            else:
+                # 通常のpointsを使用
+                points = [[p.x(), p.y()] for p in s.points]
+            
+            shape_data = dict(
+                label=s.label.encode("utf-8") if PY2 else s.label,
+                points=points,
+                group_id=s.group_id,
+                description="",
+                shape_type=s.shape_type,
+                flags=s.flags,
             )
+            
+            data.update(shape_data)
             return data
 
         shapes = [format_shape(item.shape()) for item in self.labelList]
@@ -754,18 +770,18 @@ class MainWindow(QMainWindow):
     def loadAnno(self, filename):
         with open(filename,'r') as f:
             data = json.load(f)
-        for shape in data['shapes']:
-            label = shape["label"]
+        for shape_data in data['shapes']:
+            label = shape_data["label"]
             try:
                 ttt = int(label)
                 label = self.category_list[ttt]
             except:
                 pass
 
-            points = shape["points"]
-            shape_type = shape["shape_type"]
-            flags = shape["flags"]
-            group_id = shape["group_id"]
+            points = shape_data["points"]
+            shape_type = shape_data["shape_type"]
+            flags = shape_data["flags"]
+            group_id = shape_data["group_id"]
             if not points:
                 # skip point-empty shape
                 continue
@@ -778,6 +794,7 @@ class MainWindow(QMainWindow):
             for x, y in points:
                 shape.addPoint(QtCore.QPointF(x, y))
             shape.close()
+            
             self.addLabel(shape)
         self.canvas.loadShapes([item.shape() for item in self.labelList])
 
@@ -1338,6 +1355,10 @@ class MainWindow(QMainWindow):
                 for point_index in range(pointsx.shape[0]):
                     shape.addPoint(QtCore.QPointF(pointsx[point_index], pointsy[point_index]))
                 shape.close()
+                
+                # SAMから出力された元のマスクデータを保存
+                setattr(shape, 'original_sam_mask', mask_for_shape_creation.copy())
+                
                 tmp_sam_mask_shapes.append(shape)
             
             if msk_idx == target_idx:
@@ -1435,6 +1456,10 @@ class MainWindow(QMainWindow):
                 for point_index in range(pointsx.shape[0]):
                     shape.addPoint(QtCore.QPointF(pointsx[point_index], pointsy[point_index]))
                 shape.close()
+                
+                # SAMから出力された元のマスクデータを保存
+                setattr(shape, 'original_sam_mask', mask_for_shape_creation.copy())
+                
                 tmp_sam_mask_shapes.append(shape)
             
             if msk_idx == target_idx:
@@ -1724,8 +1749,11 @@ class MainWindow(QMainWindow):
 
     def mask2polygon(self, mask):
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        contours = np.array(contours[0])
-        return contours
+        if contours:
+            # 複数の輪郭を返す（最大の輪郭の選択は呼び出し側で行う）
+            return contours
+        else:
+            return None
 
     def editLabel(self, item=None):
         if item and not isinstance(item, LabelListWidgetItem):
@@ -1877,11 +1905,13 @@ class MainWindow(QMainWindow):
             if shape.label == "secondary":
                 try:
                     # 関連するprimaryを元に戻す処理
-                    primary_ids = getattr(shape, 'primary_segment_ids', [])
+                    primary_segment_ids = getattr(shape, 'primary_segment_ids', [])
+                    primary_particle_ids = getattr(shape, 'primary_particle_ids', [])
                     secondary_group_id = shape.group_id
                     
-                    # primaryを元に戻してから削除
-                    self._restorePrimarySegments(primary_ids, secondary_group_id)
+                    # primaryを元に戻してから削除（両方のIDリストを使用）
+                    all_primary_ids = primary_segment_ids + [str(pid) for pid in primary_particle_ids]
+                    self._restorePrimarySegments(all_primary_ids, secondary_group_id)
                 except Exception as e:
                     print(f"Error restoring primaries: {e}")
         
@@ -1903,49 +1933,55 @@ class MainWindow(QMainWindow):
         primaryセグメントを元のマスク表示に戻す
         
         Args:
-            primary_ids: 復元するprimaryセグメントのID配列
+            primary_ids: 復元するprimaryセグメントのID配列（文字列または数値のリスト）
             secondary_group_id: 関連するsecondaryグループID
         """
         # デバッグ情報
-        # print(f"Restoring primaries: {primary_ids} from secondary: {secondary_group_id}")
+        print(f"Restoring primaries: {primary_ids} from secondary: {secondary_group_id}")
+        
+        # primary_idsを文字列のリストに正規化
+        primary_ids_str = [str(pid) for pid in primary_ids]
         
         # 復元されたシェイプを追跡
         restored = False
         
         for shape in self.canvas.shapes:
-            # すべての可能なID属性をチェック
-            shape_id = None
-            for id_attr in ['id', 'group_id', 'particle_id']:
-                if hasattr(shape, id_attr):
-                    shape_id = getattr(shape, id_attr)
-                    if shape_id and str(shape_id) in primary_ids:
-                        break
-            
-            # 対象のIDを持つプライマリーセグメントを探す
-            if shape_id and str(shape_id) in primary_ids:
-                # print(f"Found primary to restore: {shape_id}")
-                # セカンダリーグループIDが一致するか確認
-                if hasattr(shape, 'secondary_group_id') and shape.secondary_group_id == secondary_group_id:
-                    # print(f"Restoring shape with ID: {shape_id}")
+            # secondary_group_idが設定されているprimaryセグメントのみを対象とする
+            if hasattr(shape, 'secondary_group_id') and shape.secondary_group_id == secondary_group_id:
+                print(f"Found shape with secondary_group_id: {secondary_group_id}")
+                
+                # 元のポイントと形状を復元
+                if hasattr(shape, 'original_points') and hasattr(shape, 'original_shape_type'):
+                    # ポイントを復元
+                    shape.points.clear()
+                    for point in shape.original_points:
+                        shape.points.append(point)
                     
-                    # 元のポイントと形状を復元
+                    shape.shape_type = shape.original_shape_type
+                    shape.close()  # 形状を閉じる
+                    
+                    # マスク表示をON
+                    setattr(shape, 'is_mask_visible', True)
+                    
+                    # secondary_group_id属性をクリア
+                    if hasattr(shape, 'secondary_group_id'):
+                        delattr(shape, 'secondary_group_id')
+                    
+                    # original属性もクリア
                     if hasattr(shape, 'original_points'):
-                        # ポイントを復元
-                        shape.points = shape.original_points.copy()
-                        shape.shape_type = getattr(shape, 'original_shape_type', "polygon")
-                        setattr(shape, 'is_mask_visible', True)  # マスク表示をON
-                        
-                        # secondary_group_id属性をクリア
-                        if hasattr(shape, 'secondary_group_id'):
-                            delattr(shape, 'secondary_group_id')
-                        
-                        # 見た目を更新
-                        self._update_shape_color(shape)
-                        restored = True
+                        delattr(shape, 'original_points')
+                    if hasattr(shape, 'original_shape_type'):
+                        delattr(shape, 'original_shape_type')
+                    
+                    # 見た目を更新
+                    self._update_shape_color(shape)
+                    restored = True
+                    print(f"Restored shape to original mask form")
         
-        # キャンバス全体を更新（labelListの操作は行わない）
+        # キャンバス全体を更新
         if restored:
             self.canvas.update()
+            print(f"Canvas updated - restoration complete")
 
     def duplicateSelectedShape(self):
         added_shapes = self.canvas.duplicateSelectedShapes()
@@ -2147,6 +2183,7 @@ class MainWindow(QMainWindow):
         
         # 関連付けられたプライマリーセグメントIDを記録
         setattr(secondary_shape, 'primary_segment_ids', segment_ids)
+        setattr(secondary_shape, 'primary_particle_ids', primary_ids)
         
         # セカンダリーグループを追加
         self.addLabel(secondary_shape)
@@ -2465,7 +2502,7 @@ class MainWindow(QMainWindow):
 
     def createMaskFromJsonData(self, shapes_data, img_shape, target_label=None):
         """
-        JSONデータから直接マスク画像を生成する（領域を可視化）
+        JSONデータから直接マスク画像を生成する（SAMマスクまたはポリゴン領域を可視化）
         
         Args:
             shapes_data: シェイプデータのリスト
@@ -2479,15 +2516,9 @@ class MainWindow(QMainWindow):
         mask = np.zeros((height, width, 3), dtype=np.uint8)
         
         for shape_data in shapes_data:
-            if 'points' not in shape_data or not shape_data['points']:
-                continue
-            
             # target_labelが指定されている場合、そのラベルのみを処理
             if target_label and shape_data.get('label') != target_label:
                 continue
-                
-            # ポイントを numpy 配列に変換
-            points = np.array(shape_data['points'], dtype=np.int32)
             
             # グループIDから色を決定
             group_id = shape_data.get('group_id', 0)
@@ -2495,13 +2526,24 @@ class MainWindow(QMainWindow):
             color = LABEL_COLORMAP[color_idx % len(LABEL_COLORMAP)]
             color = (int(color[0]), int(color[1]), int(color[2]))
             
-            # ポリゴン領域を塗りつぶし
-            cv2.fillPoly(mask, [points], color)
-            
-            # 輪郭線を描画（より明確に）
-            cv2.polylines(mask, [points], isClosed=True, color=(255, 255, 255), thickness=2)
+            # ポリゴンベースの処理
+            self._create_polygon_mask(shape_data, mask, color)
         
         return mask
+    
+    def _create_polygon_mask(self, shape_data, mask, color):
+        """ポリゴンベースのマスク生成（フォールバック処理）"""
+        if 'points' not in shape_data or not shape_data['points']:
+            return
+            
+        # ポイントを numpy 配列に変換
+        points = np.array(shape_data['points'], dtype=np.int32)
+        
+        # ポリゴン領域を塗りつぶし
+        cv2.fillPoly(mask, [points], color)
+        
+        # 輪郭線を描画（より明確に）
+        cv2.polylines(mask, [points], isClosed=True, color=(255, 255, 255), thickness=2)
 
     def saveMaskAndBBoxImages(self, filename_base):
         """
