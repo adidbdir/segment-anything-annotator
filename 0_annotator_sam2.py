@@ -77,6 +77,7 @@ class MainWindow(QMainWindow):
         self.scale_value = 0.0  # スケールの実際の長さ
         self.scale_unit = "μm"  # スケールの単位
         self.scale_factor = 1.0  # ピクセルから実際の長さへの変換係数
+        self.scale_um_per_px = None  # μm/px に正規化したスケール（CSV出力用）
         self.scalebar_image = None  # スケールバー画像へのパス
         self.scale_set = False  # スケールが設定されたかどうか
 
@@ -1051,9 +1052,26 @@ class MainWindow(QMainWindow):
                 self.scale_value = scale_value
                 self.scale_unit = scale_unit
                 self.scale_set = True
+
+                # CSVは [um] 前提なので、μm/px に正規化した値を保持する
+                unit_to_um = {
+                    "μm": 1.0,
+                    "mm": 1000.0,
+                    "nm": 0.001,
+                    "cm": 10000.0,
+                    "m": 1000000.0,
+                }
+                self.scale_um_per_px = self.scale_factor * unit_to_um.get(scale_unit, 1.0)
+
+                # 既存実装は image_scaler_edit を参照して [um] 換算しているため、
+                # スケール確定時に自動で μm/px を反映しておく（手入力不要にする）
+                if hasattr(self, "image_scaler_edit") and self.image_scaler_edit is not None:
+                    self.image_scaler_edit.setText(f"{self.scale_um_per_px:.12f}")
                 
                 # ステータス表示を更新
-                self.scale_status_label.setText(f"スケール: {self.scale_factor:.6f} {scale_unit}/px")
+                self.scale_status_label.setText(
+                    f"スケール: {self.scale_um_per_px:.6f} μm/px"
+                )
                 
                 # スケールモードを終了
                 self.scale_mode = False
@@ -2457,7 +2475,12 @@ class MainWindow(QMainWindow):
                     "image_filename": image_filename,
                     "particle_id": particle_id,
                     "secondary_id": getattr(segment, 'secondary_group_id', ""),
-                    "particle_type": segment.label,  # 元のラベルを保持
+                    # NOTE:
+                    # CrystallizationAnalysis は「粒子形態」が primary/secondary の行を前提に
+                    # Lmean/Agg/n を再計算する。ここが "Object" 等になると primary が0件になり、
+                    # Lmean/Agg が NaN になってグラフ生成が落ちる。
+                    "particle_type": "primary",
+                    "label": segment.label,  # 元のラベルは別カラムに保持
                     "Lmajor [um]": round(lmajor, 3),
                     "Lminor [um]": round(lminor, 3),
                     "L[um]": round(l, 1),
@@ -2504,6 +2527,7 @@ class MainWindow(QMainWindow):
                 "particle_id": ",".join(map(str, primary_ids)),  # コンマ区切りの一次粒子ID
                 "secondary_id": getattr(primary_obbs[0], 'secondary_group_id', "") if primary_obbs else "",
                 "particle_type": "secondary",  # 二次粒子としてマーク
+                "label": "secondary",
                 "Lmajor [um]": round(lmajor_secondary, 3),
                 "Lminor [um]": round(lminor_secondary, 3),
                 "L[um]": round(l_secondary, 1),

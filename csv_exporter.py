@@ -82,6 +82,7 @@ def export_csv(results, experiment_params, output_dir):
     # ヘッダーフィールドの定義 - ふるい_500_,____.csv に合わせる
     fieldnames = [
         '画像ファイル名', '一次粒子ID', '二次粒子ID', '粒子形態', 
+        'ラベル',
         'Lmajor[um]', 'Lminor[um]', 'L[um]', 'Lmean[um]', 
         'n', 'Agg.', 'Area[um^2]'
     ]
@@ -94,6 +95,7 @@ def export_csv(results, experiment_params, output_dir):
             '一次粒子ID': result.get('particle_id', ''),
             '二次粒子ID': result.get('secondary_id', ''),
             '粒子形態': result.get('particle_type', ''),
+            'ラベル': result.get('label', ''),
             'Lmajor[um]': result.get('Lmajor [um]', ''),
             'Lminor[um]': result.get('Lminor [um]', ''),
             'L[um]': result.get('L[um]', ''),
