@@ -864,6 +864,9 @@ class MainWindow(QMainWindow):
         self.labelList.clear()
         if os.path.isfile(self.current_output_filename):
             self.loadAnno(self.current_output_filename)
+            self.grouping_complete = True
+        else:
+            self.grouping_complete = False
         self.image_encoded_flag = False
         self.current_img_data = LabelFile.load_image_file(self.current_img)
 
