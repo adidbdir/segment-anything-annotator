@@ -705,7 +705,27 @@ class MainWindow(QMainWindow):
                 shape_type=s.shape_type,
                 flags=s.flags,
             )
-            
+            custom_attrs = {}
+
+            particle_id = getattr(s, 'particle_id', None)
+            if particle_id is not None:
+                custom_attrs["particle_id"] = int(particle_id)
+
+            secondary_group_id = getattr(s, 'secondary_group_id', None)
+            if secondary_group_id is not None:
+                custom_attrs["secondary_group_id"] = int(secondary_group_id)
+
+            primary_segment_ids = getattr(s, 'primary_segment_ids', None)
+            if primary_segment_ids:
+                custom_attrs["primary_segment_ids"] = [str(x) for x in primary_segment_ids if x is not None]
+
+            primary_particle_ids = getattr(s, 'primary_particle_ids', None)
+            if primary_particle_ids:
+                custom_attrs["primary_particle_ids"] = [int(x) for x in primary_particle_ids if x is not None]
+
+            if custom_attrs:
+                shape_data["custom_attrs"] = custom_attrs
+
             data.update(shape_data)
             return data
 
@@ -795,7 +815,18 @@ class MainWindow(QMainWindow):
             for x, y in points:
                 shape.addPoint(QtCore.QPointF(x, y))
             shape.close()
-            
+
+            custom_attrs = shape_data.get("custom_attrs", {})
+            if isinstance(custom_attrs, dict):
+                for attr_name in [
+                    "particle_id",
+                    "secondary_group_id",
+                    "primary_segment_ids",
+                    "primary_particle_ids",
+                ]:
+                    if attr_name in custom_attrs:
+                        setattr(shape, attr_name, custom_attrs[attr_name])
+
             self.addLabel(shape)
         self.canvas.loadShapes([item.shape() for item in self.labelList])
 
