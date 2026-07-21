@@ -637,7 +637,7 @@ class MainWindow(QMainWindow):
         return subdir_path
 
     def saveFileAs(self, _value=False):
-        assert not self.image.isNull(), "cannot save empty image"
+        assert self.image is not None, "cannot save empty image"
         self._saveFile(self.saveFileDialog())
 
     def saveFile(self, _value=False):
@@ -2524,6 +2524,49 @@ class MainWindow(QMainWindow):
                     "Agg.": "",
                     "Area[um^2]": round(area, 2),
                 })
+            elif len(points) >= 2:
+                # 矩形の対角2点から長さを計算
+                x1, y1 = points[0]
+                x2, y2 = points[1]
+                width = abs(x2 - x1)
+                height = abs(y2 - y1)
+
+                lmajor = max(width, height) * scale
+                lminor = min(width, height) * scale
+                l = (lmajor + lminor) / 2
+
+                # マスクから面積を計算
+                area = 0
+                if isinstance(mask, np.ndarray):
+                    area = np.count_nonzero(mask) * scale**2
+                elif mask is not None and hasattr(mask, 'points'):
+                    mask_points = np.array([[p.x(), p.y()] for p in mask.points])
+                    area = cv2.contourArea(mask_points.astype(np.int32)) * scale**2
+                else:
+                    # 有効なマスクが無い場合は OBB から面積を概算
+                    area = width * height * scale**2
+
+                # 一次粒子情報を保存
+                primary_particles.append({
+                    "image_filename": image_filename,
+                    "particle_id": particle_id,
+                    "secondary_id": getattr(segment, 'secondary_group_id', ""),
+                    # NOTE:
+                    # CrystallizationAnalysis は「粒子形態」が primary/secondary の行を前提に
+                    # Lmean/Agg/n を再計算する。ここが "Object" 等になると primary が0件になり、
+                    # Lmean/Agg が NaN になってグラフ生成が落ちる。
+                    "particle_type": "primary",
+                    "label": segment.label,  # 元のラベルは別カラムに保持
+                    "Lmajor [um]": round(lmajor, 3),
+                    "Lminor [um]": round(lminor, 3),
+                    "L[um]": round(l, 1),
+                    "Lmean[um]": "",
+                    "n": "",
+                    "Agg.": "",
+                    "Area[um^2]": round(area, 2),
+                })
+            else:
+                primary_ids.pop()
         
         # 二次粒子情報を計算
         if secondary_obb:
