@@ -864,9 +864,13 @@ class MainWindow(QMainWindow):
         self.labelList.clear()
         if os.path.isfile(self.current_output_filename):
             self.loadAnno(self.current_output_filename)
-            self.grouping_complete = True
-        else:
-            self.grouping_complete = False
+        # 測定済み判定: secondary シェイプが実在する画像のみ「グループ化完了」とみなす
+        self.grouping_complete = any(
+            item.shape().label == "secondary" for item in self.labelList
+        )
+        # group_id を既存グループと衝突しないよう再同期（画像ごとに採番）
+        _max_gid = self.getMaxId()
+        self.group_id = _max_gid + 1 if _max_gid >= 0 else 1
         self.image_encoded_flag = False
         self.current_img_data = LabelFile.load_image_file(self.current_img)
 
@@ -2461,16 +2465,13 @@ class MainWindow(QMainWindow):
                 
                 # マスクから面積を計算
                 area = 0
-                if mask is not None:
-                    # マスクが画像サイズならnon-zeroピクセル数をカウント
-                    if isinstance(mask, np.ndarray):
-                        area = np.count_nonzero(mask) * scale**2
-                    # マスクがポリゴンなら輪郭点から面積計算
-                    elif hasattr(mask, 'points'):
-                        mask_points = np.array([[p.x(), p.y()] for p in mask.points])
-                        area = cv2.contourArea(mask_points.astype(np.int32)) * scale**2
+                if isinstance(mask, np.ndarray):
+                    area = np.count_nonzero(mask) * scale**2
+                elif mask is not None and hasattr(mask, 'points'):
+                    mask_points = np.array([[p.x(), p.y()] for p in mask.points])
+                    area = cv2.contourArea(mask_points.astype(np.int32)) * scale**2
                 else:
-                    # マスクがない場合はOBBから面積を概算
+                    # 有効なマスクが無い場合は OBB から面積を概算
                     area = width * height * scale**2
                 
                 # 一次粒子情報を保存
