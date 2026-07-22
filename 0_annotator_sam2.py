@@ -617,6 +617,69 @@ class MainWindow(QMainWindow):
             self.current_output_dir = self.base_output_dir
         os.makedirs(self.current_output_dir, exist_ok=True)
 
+    def _experiment_settings_path(self):
+        """実験パラメータ・スケールの永続化ファイルのパス（出力フォルダ単位）"""
+        return os.path.join(self.current_output_dir, "experiment_settings.json")
+
+    def _param_widget_map(self):
+        """CSVパラメータ名 -> 対応するQLineEditの対応表"""
+        return {
+            "date": self.date_edit,
+            "experimenter": self.experimenter_edit,
+            "impurity_type": self.impurity_type_edit,
+            "impurity_concentration": self.impurity_conc_edit,
+            "seed_size": self.seed_size_edit,
+            "crystallization_time": self.crystal_time_edit,
+            "suspension_density": self.suspension_density_edit,
+            "image_scaler": self.image_scaler_edit,
+        }
+
+    def saveExperimentSettings(self):
+        """実験パラメータとスケールを出力フォルダに保存する．
+        再開（アプリ再起動）時にスケールを測り直さず同じ値を復元することで，
+        CSVファイル名が変わらず，同一データセットの測定が1つのCSVに集約される．"""
+        try:
+            if not self.current_output_dir:
+                return
+            os.makedirs(self.current_output_dir, exist_ok=True)
+            data = {
+                "params": {key: widget.text() for key, widget in self._param_widget_map().items()},
+                "scale": {
+                    "scale_set": self.scale_set,
+                    "scale_value": self.scale_value,
+                    "scale_factor": self.scale_factor,
+                    "scale_unit": self.scale_unit,
+                    "scale_um_per_px": self.scale_um_per_px,
+                },
+            }
+            with open(self._experiment_settings_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"実験設定の保存に失敗: {e}")
+
+    def loadExperimentSettings(self):
+        """出力フォルダに保存された実験パラメータ・スケールを復元する．
+        再開時にスケールバー測定をやり直さずに済み，CSVを一本化できる．"""
+        try:
+            path = self._experiment_settings_path()
+            if not os.path.isfile(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            params = data.get("params", {})
+            for key, widget in self._param_widget_map().items():
+                if params.get(key, "") != "":
+                    widget.setText(str(params[key]))
+            scale = data.get("scale", {})
+            if scale.get("scale_set"):
+                self.scale_set = True
+                self.scale_value = scale.get("scale_value", self.scale_value)
+                self.scale_factor = scale.get("scale_factor", self.scale_factor)
+                self.scale_unit = scale.get("scale_unit", self.scale_unit)
+                self.scale_um_per_px = scale.get("scale_um_per_px", self.scale_um_per_px)
+        except Exception as e:
+            print(f"実験設定の復元に失敗: {e}")
+
     def updateFilenameLabel(self):
         """現在の画像ファイル名をUIラベルに表示する"""
         if self.current_img:
@@ -941,7 +1004,9 @@ class MainWindow(QMainWindow):
         # 入力フォルダ名を取得して保存し、出力ディレクトリを更新
         self.input_folder_name = os.path.basename(directory)
         self.updateOutputDirectory()
-        
+        # 保存済みの実験パラメータ・スケールを復元（再開時にCSVを一本化するため）
+        self.loadExperimentSettings()
+
         #self.img_list = glob.glob(directory + '/*.{jpg,png,JPG,PNG}')
         self.img_list = glob.glob(directory + '/*.jpg') + glob.glob(directory + '/*.png')
         self.img_list.sort()
@@ -1105,7 +1170,10 @@ class MainWindow(QMainWindow):
                 # スケール確定時に自動で μm/px を反映しておく（手入力不要にする）
                 if hasattr(self, "image_scaler_edit") and self.image_scaler_edit is not None:
                     self.image_scaler_edit.setText(f"{self.scale_um_per_px:.12f}")
-                
+
+                # スケール確定時に永続化（再開時に測り直し不要にする）
+                self.saveExperimentSettings()
+
                 # ステータス表示を更新
                 self.scale_status_label.setText(
                     f"スケール: {self.scale_um_per_px:.6f} μm/px"
@@ -2637,6 +2705,9 @@ class MainWindow(QMainWindow):
                 csv_path, work_dir
             )
             crystallization(rank_range_min=-50, rank_range_max=750, rank_range_width=50)
+
+            # 測定ごとに実験パラメータ・スケールを永続化（再開時のCSV一本化のため）
+            self.saveExperimentSettings()
 
         return None
 
