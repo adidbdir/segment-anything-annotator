@@ -1009,6 +1009,12 @@ class MainWindow(QMainWindow):
 
         #self.img_list = glob.glob(directory + '/*.{jpg,png,JPG,PNG}')
         self.img_list = glob.glob(directory + '/*.jpg') + glob.glob(directory + '/*.png')
+        # スケールバー画像はアノテーション対象外なので、常に画像リストから除外する
+        # （スケール測定用の検出は findScaleBarImage がフォルダを直接見るため影響しない）
+        self.img_list = [
+            p for p in self.img_list
+            if not any(k in os.path.basename(p).lower() for k in ('scalebar', 'scale', 'スケール'))
+        ]
         self.img_list.sort()
         self.img_len = len(self.img_list)
         if self.img_len == 0:
