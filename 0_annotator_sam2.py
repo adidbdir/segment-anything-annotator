@@ -897,9 +897,7 @@ class MainWindow(QMainWindow):
         # e = time.time()
         if self.actions.save.isEnabled():
             self.saveFile()
-        if not self.grouping_complete:  # グループ分けが完了していない場合
-            QMessageBox.warning(self, self.tr("Warning"), self.tr("Please complete grouping before moving to the next image."))
-            return
+        # 画像間は常に自由に移動できるようにする（グループ未完了でもブロックしない）
         if self.current_img_index < self.img_len - 1:
             self.current_img_index += 1
             self.current_img = self.img_list[self.current_img_index]
