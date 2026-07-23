@@ -680,6 +680,40 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"実験設定の復元に失敗: {e}")
 
+    def recoverScaleFromExistingCSV(self):
+        """設定ファイルが無い既存データ向けのフォールバック。
+        出力フォルダの既存CSVファイル名末尾（image_scaler）からスケールを復元し、
+        注釈済みデータを開き直すたびにスケールを測り直す問題を防ぐ。"""
+        try:
+            if self.scale_set:
+                return
+            if not self.current_output_dir or not os.path.isdir(self.current_output_dir):
+                return
+            candidates = []
+            for f in glob.glob(os.path.join(self.current_output_dir, "*.csv")):
+                base = os.path.basename(f)
+                if base.startswith("aggregate"):
+                    continue
+                stem = base[:-4] if base.lower().endswith(".csv") else base
+                # ファイル名は ..._{image_scaler}.csv 形式なので末尾トークンを取り出す
+                token = stem.rsplit("_", 1)[-1]
+                try:
+                    val = float(token)
+                except ValueError:
+                    continue
+                candidates.append((os.path.getmtime(f), token, val))
+            if not candidates:
+                return
+            candidates.sort()
+            _, token, val = candidates[-1]  # 最新CSVのスケールを採用
+            self.image_scaler_edit.setText(token)
+            self.scale_set = True
+            self.scale_um_per_px = val
+            self.scale_factor = val
+            print(f"既存CSVからスケールを復元しました: {token}")
+        except Exception as e:
+            print(f"既存CSVからのスケール復元に失敗: {e}")
+
     def updateFilenameLabel(self):
         """現在の画像ファイル名をUIラベルに表示する"""
         if self.current_img:
@@ -1004,6 +1038,8 @@ class MainWindow(QMainWindow):
         self.updateOutputDirectory()
         # 保存済みの実験パラメータ・スケールを復元（再開時にCSVを一本化するため）
         self.loadExperimentSettings()
+        # 設定ファイルが無い既存データは、既存CSVのファイル名からスケールを復元する
+        self.recoverScaleFromExistingCSV()
 
         #self.img_list = glob.glob(directory + '/*.{jpg,png,JPG,PNG}')
         self.img_list = glob.glob(directory + '/*.jpg') + glob.glob(directory + '/*.png')
