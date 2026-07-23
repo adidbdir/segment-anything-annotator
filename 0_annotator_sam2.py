@@ -1059,14 +1059,9 @@ class MainWindow(QMainWindow):
         self.img_progress_bar.setMaximum(self.img_len-1)
         
         self.loadImg()
-        
-        # ディレクトリ選択後、スケールが未設定ならスケールバー設定処理を開始
-        if not self.scale_set:
-            # スケールバー画像を検索して表示
-            found = self.findScaleBarImage()
-            if found:
-                # スケールバー測定モードを開始
-                self.startScaleBarMode()
+
+        # フォルダを開いた時点ではスケール測定を強制しない（スケール画像を先頭に出さない）。
+        # スケールは可能なら上で復元済み。未設定でも測定は「スケールバー測定」ボタンから任意に実行する。
 
 
     def clickSaveChoose(self):
