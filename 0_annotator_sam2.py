@@ -1071,7 +1071,7 @@ class MainWindow(QMainWindow):
         if self.image_directory is not None:
             directory = self.image_directory
         else:
-            directory = QFileDialog.getExistingDirectory(self, 'choose target fold','.')
+            directory = QFileDialog.getExistingDirectory(self, 'choose target fold', 'input')
         if directory == '':
             return
         
@@ -1199,7 +1199,7 @@ class MainWindow(QMainWindow):
         
         # 単位選択用のコンボボックス付きのダイアログを作成
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("スケール設定")
+        dialog.setWindowTitle(self.tr("スケール設定"))
         layout = QtWidgets.QVBoxLayout(dialog)
         
         # 値入力用のウィジェット
@@ -3284,6 +3284,9 @@ if __name__ == '__main__':
     sam_model = args.sam_model
 
     app = QApplication(sys.argv)
+    # 日本語UIが正しく表示されるようフォントを指定（WSL等でCJKフォントが既定でないため）
+    font = QtGui.QFont("Noto Sans CJK JP")
+    app.setFont(font)
     main = MainWindow(
         global_h=global_h,
         global_w=global_w,
