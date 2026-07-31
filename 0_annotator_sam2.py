@@ -1065,8 +1065,13 @@ class MainWindow(QMainWindow):
         
         self.loadImg()
 
-        # フォルダを開いた時点ではスケール測定を強制しない（スケール画像を先頭に出さない）。
-        # スケールは可能なら上で復元済み。未設定でも測定は「スケールバー測定」ボタンから任意に実行する。
+        # スケールが復元できなかった「真の新規データ」のみ、スケール測定を自動で促す。
+        # 既存データは上で experiment_settings.json / 既存CSV から復元済みのため、ここは発火しない
+        # （＝注釈済みデータを開き直してもスケール画像は出ない）。
+        if not self.scale_set:
+            found = self.findScaleBarImage()
+            if found:
+                self.startScaleBarMode()
 
 
     def clickSaveChoose(self):
