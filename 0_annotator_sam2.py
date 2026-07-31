@@ -61,10 +61,11 @@ class MainWindow(QMainWindow):
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = 0, 1, 2
 
     def __init__(self, parent=None, global_w=1000, global_h=1800, model_type='vit_b', keep_input_size=True, max_size=1080, category_file='primary.txt',
-                 save_mask=True, save_bbox=True, save_labels=True, image_directory=None):
+                 save_mask=True, save_bbox=True, save_labels=True, image_directory=None, sam_model='large'):
         super(MainWindow, self).__init__(parent)
         self.resize(global_w, global_h)
         self.model_type = model_type
+        self.sam_model = sam_model  # 読み込むSAM2モデルのサイズ (tiny/small/base_plus/large)
         self.keep_input_size = keep_input_size
         self.max_size = float(max_size)
         self.category_file = category_file
@@ -936,7 +937,12 @@ class MainWindow(QMainWindow):
         if not self.scale_set:
             QMessageBox.warning(self, self.tr("Warning"), self.tr("スケールが設定されていません。先にスケールを設定してください。"))
             return
-        # スケール設定後は、グループ未完了でも画像間を自由に移動できる
+        # primary があるのに secondary(グループ)が無い場合は、グループ化を促してブロックする。
+        # 空画像(primaryなし)やグループ済み(secondaryあり)は自由に移動できる。
+        _labels = [item.shape().label for item in self.labelList]
+        if any(l == "primary" for l in _labels) and not any(l == "secondary" for l in _labels):
+            QMessageBox.warning(self, self.tr("Warning"), self.tr("primary をグループ化してください（グループ化していないと次へ進めません）。"))
+            return
         if self.current_img_index < self.img_len - 1:
             self.current_img_index += 1
             self.current_img = self.img_list[self.current_img_index]
@@ -1334,7 +1340,16 @@ class MainWindow(QMainWindow):
 
     def clickLoadSAM(self):
         # download_model(self.model_type)
-        self.sam = build_sam2(config_file='configs/sam2.1/sam2.1_hiera_l.yaml', ckpt_path='external/sam2/checkpoints/sam2.1_hiera_large.pt')
+        # SAM2モデルのサイズごとの (config, checkpoint) 対応表
+        sam2_models = {
+            "tiny":      ("configs/sam2.1/sam2.1_hiera_t.yaml",  "external/sam2/checkpoints/sam2.1_hiera_tiny.pt"),
+            "small":     ("configs/sam2.1/sam2.1_hiera_s.yaml",  "external/sam2/checkpoints/sam2.1_hiera_small.pt"),
+            "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "external/sam2/checkpoints/sam2.1_hiera_base_plus.pt"),
+            "large":     ("configs/sam2.1/sam2.1_hiera_l.yaml",  "external/sam2/checkpoints/sam2.1_hiera_large.pt"),
+        }
+        config_file, ckpt_path = sam2_models.get(getattr(self, "sam_model", "large"), sam2_models["large"])
+        print(f"SAM2モデルを読み込みます: {getattr(self, 'sam_model', 'large')} ({ckpt_path})")
+        self.sam = build_sam2(config_file=config_file, ckpt_path=ckpt_path)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.sam.to(device=self.device)
         self.predictor = SAM2ImagePredictor(self.sam)
@@ -2095,6 +2110,49 @@ class MainWindow(QMainWindow):
         self.labelList.clearSelection()
         self.setDirty()
 
+    def removeSecondaryFromCSV(self, secondary_group_id):
+        """GUIで二次粒子(グループ)を削除したとき、CSV上の該当行も除去してExcel/集計を更新する。
+        現在の画像・該当の二次粒子IDに一致する行(=そのグループのprimary/secondary行)を削除し、
+        残りで再集計する。CSVが追記式で削除に追随しない問題への対策。"""
+        try:
+            import pandas as pd
+            if not self.current_output_dir or not self.current_img:
+                return
+            experiment_params = {
+                "date": self.date_edit.text(),
+                "experimenter": self.experimenter_edit.text(),
+                "impurity_type": self.impurity_type_edit.text(),
+                "impurity_concentration": self.impurity_conc_edit.text(),
+                "seed_size": self.seed_size_edit.text(),
+                "crystallization_time": self.crystal_time_edit.text(),
+                "suspension_density": self.suspension_density_edit.text(),
+                "image_scaler": self.image_scaler_edit.text(),
+            }
+            filename = csv_exporter.construct_csv_filename(experiment_params)
+            csv_path = os.path.join(self.current_output_dir, filename)
+            if not os.path.isfile(csv_path):
+                return
+            df = pd.read_csv(csv_path)
+            if "画像ファイル名" not in df.columns or "二次粒子ID" not in df.columns:
+                return
+            img = os.path.basename(self.current_img)
+            mask = (
+                (df["画像ファイル名"].astype(str) == img)
+                & (df["二次粒子ID"].astype(str) == str(secondary_group_id))
+            )
+            if not mask.any():
+                return
+            df = df[~mask]
+            df.to_csv(csv_path, index=False)
+            print(f"CSVから二次粒子ID={secondary_group_id}({img})の行を削除しました")
+            # 残りの行があれば集計・Excel・グラフを再生成
+            if len(df) > 0:
+                CrystallizationAnalysis(csv_path, self.current_output_dir)(
+                    rank_range_min=-50, rank_range_max=750, rank_range_width=50
+                )
+        except Exception as e:
+            print(f"CSVからの二次粒子削除に失敗: {e}")
+
     def deleteSelectedShape(self):
         """選択されたシェイプを削除し、関連するprimaryを元に戻す"""
         # 選択されたシェイプが存在しない場合は何もしない
@@ -2118,6 +2176,8 @@ class MainWindow(QMainWindow):
                     self._restorePrimarySegments(all_primary_ids, secondary_group_id)
                 except Exception as e:
                     print(f"Error restoring primaries: {e}")
+                # 削除した二次粒子のCSV行も除去してExcel/集計を更新する
+                self.removeSecondaryFromCSV(shape.group_id)
         
         # 次に、すべてのシェイプを削除
         for shape in shapes_to_delete:
@@ -3109,7 +3169,13 @@ def get_parser():
         "--image_directory",
         default=None,
         help="Directory containing images to annotate"
-    )   
+    )
+    parser.add_argument(
+        "--sam_model",
+        default='large',
+        choices=['tiny', 'small', 'base_plus', 'large'],
+        help="読み込むSAM2モデルのサイズ (tiny/small/base_plus/large)"
+    )
     return parser
 
 if __name__ == '__main__':
@@ -3124,19 +3190,21 @@ if __name__ == '__main__':
     save_bbox = args.save_bbox
     save_labels = args.save_labels
     image_directory = args.image_directory
-    
+    sam_model = args.sam_model
+
     app = QApplication(sys.argv)
     main = MainWindow(
-        global_h=global_h, 
-        global_w=global_w, 
-        model_type=model_type, 
-        keep_input_size=keep_input_size, 
-        max_size=max_size, 
+        global_h=global_h,
+        global_w=global_w,
+        model_type=model_type,
+        keep_input_size=keep_input_size,
+        max_size=max_size,
         category_file=category_file,
         save_mask=save_mask,
         save_bbox=save_bbox,
         save_labels=save_labels,
-        image_directory=image_directory
+        image_directory=image_directory,
+        sam_model=sam_model
     )
     main.show()
     sys.exit(app.exec_())
