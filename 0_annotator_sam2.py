@@ -949,6 +949,7 @@ class MainWindow(QMainWindow):
                     _contained.add(str(_x))
                 for _x in (getattr(_s, 'primary_particle_ids', None) or []):
                     _contained.add(str(_x))
+        _has_ungrouped = False
         for _it in self.labelList:
             _s = _it.shape()
             if _s.label == "primary":
@@ -956,8 +957,19 @@ class MainWindow(QMainWindow):
                 _pid = getattr(_s, 'particle_id', None)
                 _pid = str(_pid) if _pid is not None else None
                 if _gid not in _contained and (_pid is None or _pid not in _contained):
-                    QMessageBox.warning(self, self.tr("Warning"), self.tr("グループ化していない primary があります。すべての primary を secondary にまとめてから次へ進んでください。"))
-                    return
+                    _has_ungrouped = True
+                    break
+        # 未グループの primary があれば確認する。ハードブロックにすると、リンク情報が
+        # 欠けた画像で誤検知したときに操作不能(詰み)になるため、確認ダイアログにする。
+        # 既定は「いいえ(進まない)」なので、うっかりスキップは防げる。
+        if _has_ungrouped:
+            _ans = QMessageBox.question(
+                self, self.tr("確認"),
+                self.tr("グループ化していない primary があります。\nこのまま次の画像へ進みますか？（未グループの粒子は集計されません）"),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if _ans != QMessageBox.Yes:
+                return
         if self.current_img_index < self.img_len - 1:
             self.current_img_index += 1
             self.current_img = self.img_list[self.current_img_index]
@@ -2661,11 +2673,18 @@ class MainWindow(QMainWindow):
                 max_id = max(max_id, shape.particle_id)
         
         # 各一次粒子の処理
+        used_ids = set()  # グループ内でのID重複を防ぐ（重複するとdedupで行が落ちる）
         for idx, (segment, mask) in enumerate(zip(primary_obbs, primary_masks)):
-            # 各セグメントに一意なIDを割り当て
-            if not hasattr(segment, 'particle_id') or segment.particle_id is None:
-                segment.particle_id = max_id + idx + 1
-            
+            # 各セグメントに一意なIDを割り当て。
+            # ID未設定、または同一グループ内で既に使われているID(複製由来など)の場合は再採番する。
+            _pid = getattr(segment, 'particle_id', None)
+            if _pid is None or _pid in used_ids:
+                _pid = max_id + idx + 1
+                while _pid in used_ids:
+                    _pid += 1
+                segment.particle_id = _pid
+            used_ids.add(_pid)
+
             particle_id = segment.particle_id
             primary_ids.append(particle_id)
             

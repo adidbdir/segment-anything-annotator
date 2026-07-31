@@ -964,6 +964,13 @@ class Canvas(QtWidgets.QWidget):
     def duplicateSelectedShapes(self):
         if self.selectedShapes:
             self.selectedShapesCopy = [s.copy() for s in self.selectedShapes]
+            # 複製したシェイプは「別の新しい粒子」として扱うため、ID/グループ紐付けをクリアする。
+            # particle_id を引き継ぐと、同一グループに入れたとき集計側の重複除去で行が落ち、
+            # n/Lmean が狂う（複製→再グループでのデータ破損対策）。
+            for _s in self.selectedShapesCopy:
+                for _attr in ('particle_id', 'secondary_group_id', 'primary_segment_ids', 'primary_particle_ids'):
+                    if hasattr(_s, _attr):
+                        delattr(_s, _attr)
             self.boundedShiftShapes(self.selectedShapesCopy)
             self.endMove(copy=True)
         return self.selectedShapes
