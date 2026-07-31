@@ -941,40 +941,33 @@ class MainWindow(QMainWindow):
         if not self.scale_set:
             QMessageBox.warning(self, self.tr("Warning"), self.tr("スケールが設定されていません。先にスケールを設定してください。"))
             return
-        # すべての primary が secondary に内包されているか確認する。
-        # 保存JSONにリンク情報(primary_segment_ids等)が無い（旧データ/再読込）場合は
-        # 内包関係を判定できないため、その画像では未グループ扱いにしない（誤警告を防ぐ）。
-        _labels = [_it.shape().label for _it in self.labelList]
-        _has_primary = any(l == "primary" for l in _labels)
-        _has_secondary = any(l == "secondary" for l in _labels)
+        # primary がグループ化(secondaryに内包)されているかを判定する。
+        # 主シグナルは primary 自身の secondary_group_id（グループ化時に付与され、保存/復元される）。
+        # 補助的に、secondary の内包リスト(primary_segment_ids/particle_ids)に含まれるかも見る。
+        # どちらの印も無い primary（新規に描いて未グループ等）があれば警告する。
         _contained = set()
-        _has_linkage = False
         for _it in self.labelList:
             _s = _it.shape()
             if _s.label == "secondary":
-                _seg = getattr(_s, 'primary_segment_ids', None) or []
-                _par = getattr(_s, 'primary_particle_ids', None) or []
-                if _seg or _par:
-                    _has_linkage = True
-                for _x in _seg:
+                for _x in (getattr(_s, 'primary_segment_ids', None) or []):
                     _contained.add(str(_x))
-                for _x in _par:
+                for _x in (getattr(_s, 'primary_particle_ids', None) or []):
                     _contained.add(str(_x))
         _has_ungrouped = False
-        if _has_primary and not _has_secondary:
-            # primary を描いたのにグループ(secondary)が1つも無い
-            _has_ungrouped = True
-        elif _has_linkage:
-            # リンク情報がある場合のみ、内包されていない primary を厳密に検出する
-            for _it in self.labelList:
-                _s = _it.shape()
-                if _s.label == "primary":
-                    _gid = str(getattr(_s, 'group_id', ''))
-                    _pid = getattr(_s, 'particle_id', None)
-                    _pid = str(_pid) if _pid is not None else None
-                    if _gid not in _contained and (_pid is None or _pid not in _contained):
-                        _has_ungrouped = True
-                        break
+        for _it in self.labelList:
+            _s = _it.shape()
+            if _s.label != "primary":
+                continue
+            _grouped = getattr(_s, 'secondary_group_id', None) is not None
+            if not _grouped:
+                _gid = str(getattr(_s, 'group_id', ''))
+                _pid = getattr(_s, 'particle_id', None)
+                _pid = str(_pid) if _pid is not None else None
+                if _gid in _contained or (_pid is not None and _pid in _contained):
+                    _grouped = True
+            if not _grouped:
+                _has_ungrouped = True
+                break
         # 未グループの primary があれば確認する。ハードブロックにすると、リンク情報が
         # 欠けた画像で誤検知したときに操作不能(詰み)になるため、確認ダイアログにする。
         # 既定は「いいえ(進まない)」なので、うっかりスキップは防げる。
