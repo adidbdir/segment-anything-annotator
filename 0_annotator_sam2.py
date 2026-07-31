@@ -610,6 +610,23 @@ class MainWindow(QMainWindow):
         self.area_threshold_spinbox.move(int(0.12 * global_w), int(0.92 * global_h)) # Adjust position
         self.area_threshold_spinbox.resize(int(0.07 * global_w), int(0.025 * global_h)) # Adjust size
 
+    def _relative_input_name(self, directory):
+        """出力ディレクトリ名を決める。入力パス中の最後の "input" 以降の相対パスを返し、
+        出力に入力の階層（ユーザー名/フォルダ名 等）を反映する。
+        例: .../input/aoi/2026...hirox/212-300 → aoi/2026...hirox/212-300
+        "input" が含まれない場合は末尾フォルダ名のみ（従来動作）。"""
+        try:
+            norm = os.path.normpath(directory)
+            parts = [p for p in norm.split(os.sep) if p not in ('', '.')]
+            if 'input' in parts:
+                idx = len(parts) - 1 - parts[::-1].index('input')  # 最後の 'input' の位置
+                rel_parts = parts[idx + 1:]
+                if rel_parts:
+                    return os.path.join(*rel_parts)
+        except Exception as e:
+            print(f"出力フォルダ名の算出に失敗、basenameを使用: {e}")
+        return os.path.basename(os.path.normpath(directory))
+
     def updateOutputDirectory(self):
         """入力フォルダ名に基づいて出力ディレクトリを更新する"""
         if self.input_folder_name:
@@ -1090,7 +1107,10 @@ class MainWindow(QMainWindow):
             return
         
         # 入力フォルダ名を取得して保存し、出力ディレクトリを更新
-        self.input_folder_name = os.path.basename(directory)
+        # 出力に入力の階層（ユーザー名/フォルダ名 等）を反映するため、
+        # パス中の "input" ルート以降の相対パスを使う（例: input/aoi/X/フォルダ → aoi/X/フォルダ）。
+        # "input" が含まれないパスは従来どおり末尾フォルダ名のみ。
+        self.input_folder_name = self._relative_input_name(directory)
         self.updateOutputDirectory()
         # 保存済みの実験パラメータ・スケールを復元（再開時にCSVを一本化するため）
         self.loadExperimentSettings()
