@@ -929,6 +929,11 @@ class MainWindow(QMainWindow):
                     if attr_name in custom_attrs:
                         setattr(shape, attr_name, custom_attrs[attr_name])
 
+            # 既存(JSONから読込)shapeには印を付け、未グループ判定の対象外にする。
+            # 判定は「このセッションで新規に描いたprimary」のみ対象とし、リンク情報を持たない
+            # 古い保存データで誤警告しないようにする。
+            setattr(shape, 'loaded_from_json', True)
+
             self.addLabel(shape)
         self.canvas.loadShapes([item.shape() for item in self.labelList])
 
@@ -957,6 +962,10 @@ class MainWindow(QMainWindow):
         for _it in self.labelList:
             _s = _it.shape()
             if _s.label != "primary":
+                continue
+            # 既存(JSONから読み込んだ)primaryは検査対象外。古い保存データは
+            # リンク情報を持たずグループ状態を判定できないため誤警告を避ける。
+            if getattr(_s, 'loaded_from_json', False):
                 continue
             _grouped = getattr(_s, 'secondary_group_id', None) is not None
             if not _grouped:
