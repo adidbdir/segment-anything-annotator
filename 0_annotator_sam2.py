@@ -931,7 +931,12 @@ class MainWindow(QMainWindow):
         # e = time.time()
         if self.actions.save.isEnabled():
             self.saveFile()
-        # 画像間は常に自由に移動できるようにする（グループ未完了でもブロックしない）
+        # スケール未設定のうちは次へ進めない（先にスケールを設定させる）。
+        # スケールは既存データならCSVから自動復元されるため、通常は初回の新規データのみここで止まる。
+        if not self.scale_set:
+            QMessageBox.warning(self, self.tr("Warning"), self.tr("スケールが設定されていません。先にスケールを設定してください。"))
+            return
+        # スケール設定後は、グループ未完了でも画像間を自由に移動できる
         if self.current_img_index < self.img_len - 1:
             self.current_img_index += 1
             self.current_img = self.img_list[self.current_img_index]
