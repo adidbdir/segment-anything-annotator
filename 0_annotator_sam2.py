@@ -937,12 +937,27 @@ class MainWindow(QMainWindow):
         if not self.scale_set:
             QMessageBox.warning(self, self.tr("Warning"), self.tr("スケールが設定されていません。先にスケールを設定してください。"))
             return
-        # primary があるのに secondary(グループ)が無い場合は、グループ化を促してブロックする。
-        # 空画像(primaryなし)やグループ済み(secondaryあり)は自由に移動できる。
-        _labels = [item.shape().label for item in self.labelList]
-        if any(l == "primary" for l in _labels) and not any(l == "secondary" for l in _labels):
-            QMessageBox.warning(self, self.tr("Warning"), self.tr("primary をグループ化してください（グループ化していないと次へ進めません）。"))
-            return
+        # すべての primary が secondary(グループ)に内包されている必要がある。
+        # 各 secondary の内包リスト(primary_segment_ids / primary_particle_ids)に
+        # 含まれない primary が1つでもあればグループ化を促してブロックする。
+        # 空画像(primaryなし)やすべて内包済みの画像は自由に移動できる。
+        _contained = set()
+        for _it in self.labelList:
+            _s = _it.shape()
+            if _s.label == "secondary":
+                for _x in (getattr(_s, 'primary_segment_ids', None) or []):
+                    _contained.add(str(_x))
+                for _x in (getattr(_s, 'primary_particle_ids', None) or []):
+                    _contained.add(str(_x))
+        for _it in self.labelList:
+            _s = _it.shape()
+            if _s.label == "primary":
+                _gid = str(getattr(_s, 'group_id', ''))
+                _pid = getattr(_s, 'particle_id', None)
+                _pid = str(_pid) if _pid is not None else None
+                if _gid not in _contained and (_pid is None or _pid not in _contained):
+                    QMessageBox.warning(self, self.tr("Warning"), self.tr("グループ化していない primary があります。すべての primary を secondary にまとめてから次へ進んでください。"))
+                    return
         if self.current_img_index < self.img_len - 1:
             self.current_img_index += 1
             self.current_img = self.img_list[self.current_img_index]
