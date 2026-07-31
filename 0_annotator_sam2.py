@@ -690,7 +690,7 @@ class MainWindow(QMainWindow):
                 return
             if not self.current_output_dir or not os.path.isdir(self.current_output_dir):
                 return
-            candidates = []
+            distinct = {}  # token(文字列) -> float値
             for f in glob.glob(os.path.join(self.current_output_dir, "*.csv")):
                 base = os.path.basename(f)
                 if base.startswith("aggregate"):
@@ -702,11 +702,15 @@ class MainWindow(QMainWindow):
                     val = float(token)
                 except ValueError:
                     continue
-                candidates.append((os.path.getmtime(f), token, val))
-            if not candidates:
+                distinct[token] = val
+            if not distinct:
                 return
-            candidates.sort()
-            _, token, val = candidates[-1]  # 最新CSVのスケールを採用
+            # スケール値が食い違う複数CSVがある場合は、どれが現在のデータのものか特定できないため
+            # 誤ったスケールで測定しないよう自動復元しない（ユーザーに手動設定/測定させる）。
+            if len(distinct) > 1:
+                print(f"既存CSVのスケールが複数あり曖昧なため自動復元しません: {sorted(distinct.keys())}")
+                return
+            token, val = next(iter(distinct.items()))
             self.image_scaler_edit.setText(token)
             self.scale_set = True
             self.scale_um_per_px = val
@@ -2180,6 +2184,58 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"CSVからの二次粒子削除に失敗: {e}")
 
+    def removeDeletedShapesFromCSV(self, deleted_shapes):
+        """GUIで削除したシェイプに対応するCSV行を除去し、集計/Excelを更新する。
+        - secondary を削除 → そのグループ(二次粒子ID)の全行を除去
+        - primary を削除 → その一次粒子IDのprimary行を除去（残りで再集計され n/Lmean が是正される）
+        CSV名を現在のUI値から再構築せず、出力フォルダ内で「現在画像の行を持つCSV」を探して対象にする
+        （測定後にパラメータを変えても正しいCSVを消せるようにするため）。削除はまとめて1回だけ再集計する。"""
+        try:
+            import pandas as pd
+            if not self.current_output_dir or not self.current_img:
+                return
+            img = os.path.basename(self.current_img)
+            drop_group_ids = set()
+            drop_primary_ids = set()
+            for sh in deleted_shapes:
+                label = getattr(sh, 'label', '')
+                if label == 'secondary':
+                    drop_group_ids.add(str(sh.group_id))
+                elif label == 'primary':
+                    pid = getattr(sh, 'particle_id', None)
+                    if pid is not None:
+                        drop_primary_ids.add(str(pid))
+            if not drop_group_ids and not drop_primary_ids:
+                return
+            for csv_path in glob.glob(os.path.join(self.current_output_dir, "*.csv")):
+                if os.path.basename(csv_path).startswith("aggregate"):
+                    continue
+                try:
+                    df = pd.read_csv(csv_path)
+                except Exception:
+                    continue
+                if "画像ファイル名" not in df.columns:
+                    continue
+                img_mask = df["画像ファイル名"].astype(str) == img
+                if not img_mask.any():
+                    continue  # このCSVに現在画像の行は無い
+                drop_mask = pd.Series(False, index=df.index)
+                if drop_group_ids and "二次粒子ID" in df.columns:
+                    drop_mask |= img_mask & df["二次粒子ID"].astype(str).isin(drop_group_ids)
+                if drop_primary_ids and "一次粒子ID" in df.columns and "粒子形態" in df.columns:
+                    drop_mask |= img_mask & (df["粒子形態"].astype(str) == "primary") & df["一次粒子ID"].astype(str).isin(drop_primary_ids)
+                if not drop_mask.any():
+                    continue
+                df = df[~drop_mask]
+                df.to_csv(csv_path, index=False)
+                print(f"CSVから削除行を除去しました: {os.path.basename(csv_path)} ({int(drop_mask.sum())}行)")
+                if len(df) > 0:
+                    CrystallizationAnalysis(csv_path, self.current_output_dir)(
+                        rank_range_min=-50, rank_range_max=750, rank_range_width=50
+                    )
+        except Exception as e:
+            print(f"CSVからの削除反映に失敗: {e}")
+
     def deleteSelectedShape(self):
         """選択されたシェイプを削除し、関連するprimaryを元に戻す"""
         # 選択されたシェイプが存在しない場合は何もしない
@@ -2203,18 +2259,19 @@ class MainWindow(QMainWindow):
                     self._restorePrimarySegments(all_primary_ids, secondary_group_id)
                 except Exception as e:
                     print(f"Error restoring primaries: {e}")
-                # 削除した二次粒子のCSV行も除去してExcel/集計を更新する
-                self.removeSecondaryFromCSV(shape.group_id)
-        
+
         # 次に、すべてのシェイプを削除
         for shape in shapes_to_delete:
             # キャンバスからシェイプを削除
             self.canvas.deleteShape(shape)
-            
+
             # labelListからシェイプに関連するアイテムを見つけて削除
             # 既存のremLabelsメソッドを使用
             self.remLabels([shape])
-        
+
+        # 削除したシェイプ(secondary/primary)のCSV行を除去し、まとめて再集計する
+        self.removeDeletedShapesFromCSV(shapes_to_delete)
+
         # 変更を記録して更新
         self.setDirty()
         self.canvas.update()
