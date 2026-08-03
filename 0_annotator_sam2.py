@@ -12,7 +12,6 @@ import time
 import argparse
 import numpy as np
 import tempfile
-import torch
 import base64
 import csv
 import uuid
@@ -43,8 +42,14 @@ Click = namedtuple('Click', ['is_positive', 'coords'])
 # from segment_anything import sam_model_registry, SamPredictor
 # sys.path.append('../sam2')
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'external', 'sam2')))
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+from sam_adapter import (
+    MICRO_SAM_MODEL_NAMES,
+    SAM2_MODEL_SPECS,
+    NotInstalledError,
+    Sam2Adapter,
+    SegmenterAdapter,
+    build_image_key,
+)
 import csv_exporter
 from icecream import ic
 
@@ -104,10 +109,13 @@ class MainWindow(QMainWindow):
         self.masks = []
         self.sam_mask = []
         self.sam_mask_proposal = []
-        self.image_encoded_flag = False
         self.min_point_dis = 4
 
-        self.predictor = None
+        # Segmentation backend: a SegmenterAdapter owns the model, the
+        # predictor, and its embedding cache. See sam_adapter.py. Embedding
+        # freshness (recompute vs. cache-hit) is fully delegated to the
+        # adapter -- there is no more MainWindow-level "encoded" flag.
+        self.segmenter: SegmenterAdapter | None = None
 
         self.scroll_values = {
             Qt.Horizontal: {},
@@ -279,14 +287,7 @@ class MainWindow(QMainWindow):
             self.tr("Image Directory"),
             enabled=True,
         )
-        LoadSAM = action(
-            self.tr("Load SAM"),
-            lambda: self.clickLoadSAM(),
-            'None',
-            "objects",
-            self.tr("Load SAM"),
-            enabled=True,
-        )
+        LoadSAM = self._buildSamModelMenuAction()
         AutoSeg = action(
             self.tr("AutoSeg"),
             lambda: self.clickAutoSeg(),
@@ -1070,7 +1071,8 @@ class MainWindow(QMainWindow):
         # group_id を既存グループと衝突しないよう再同期（画像ごとに採番）
         _max_gid = self.getMaxId()
         self.group_id = _max_gid + 1 if _max_gid >= 0 else 1
-        self.image_encoded_flag = False
+        # No embedding-flag reset needed here: the adapter's image_key-based
+        # cache naturally re-encodes once self.current_img changes.
         self.current_img_data = LabelFile.load_image_file(self.current_img)
 
     def adjustZoomToFitImage(self):
@@ -1403,25 +1405,99 @@ class MainWindow(QMainWindow):
         except Exception as e:
             pass
 
-    def clickLoadSAM(self):
-        # download_model(self.model_type)
-        # SAM2モデルのサイズごとの (config, checkpoint) 対応表
-        sam2_models = {
-            "tiny":      ("configs/sam2.1/sam2.1_hiera_t.yaml",  "external/sam2/checkpoints/sam2.1_hiera_tiny.pt"),
-            "small":     ("configs/sam2.1/sam2.1_hiera_s.yaml",  "external/sam2/checkpoints/sam2.1_hiera_small.pt"),
-            "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "external/sam2/checkpoints/sam2.1_hiera_base_plus.pt"),
-            "large":     ("configs/sam2.1/sam2.1_hiera_l.yaml",  "external/sam2/checkpoints/sam2.1_hiera_large.pt"),
-        }
-        config_file, ckpt_path = sam2_models.get(getattr(self, "sam_model", "large"), sam2_models["large"])
-        print(f"SAM2モデルを読み込みます: {getattr(self, 'sam_model', 'large')} ({ckpt_path})")
-        self.sam = build_sam2(config_file=config_file, ckpt_path=ckpt_path)
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.sam.to(device=self.device)
-        self.predictor = SAM2ImagePredictor(self.sam)
-        self.actions.loadSAM.setEnabled(False)
-        #self.actions.autoSeg.setEnabled(True)
+    def _buildSamModelMenuAction(self):
+        """Build the toolbar 'SAM Model' dropdown menu.
+
+        Lists all SAM2 sizes (tiny/small/base_plus/large) as checkable,
+        mutually exclusive entries that trigger clickLoadSAM(model_name) on
+        selection (this both performs the initial load and runtime
+        switches). Also lists micro-sam entries, permanently disabled in
+        Phase 1 with a tooltip pointing to the future isolated-environment
+        install.
+        """
+        self.samModelMenu = QtWidgets.QMenu(self.tr("SAM Model"), self)
+        self.samModelActionGroup = QtWidgets.QActionGroup(self)
+        self.samModelActionGroup.setExclusive(True)
+        self.samModelActions = {}
+        for name in SAM2_MODEL_SPECS:
+            act = QtWidgets.QAction(name, self, checkable=True)
+            act.setChecked(name == self.sam_model)
+            act.triggered.connect(functools.partial(self.clickLoadSAM, name))
+            self.samModelActionGroup.addAction(act)
+            self.samModelMenu.addAction(act)
+            self.samModelActions[name] = act
+
+        microSamMenu = self.samModelMenu.addMenu(self.tr("micro-sam"))
+        micro_sam_tip = self.tr(
+            "未導入(別環境/Phase 3): micro-sam は別環境へのインストールが必要です"
+        )
+        for name in MICRO_SAM_MODEL_NAMES:
+            micro_act = QtWidgets.QAction(self.tr(f"{name} (未導入/Phase 3)"), self)
+            micro_act.setEnabled(False)
+            micro_act.setToolTip(micro_sam_tip)
+            micro_act.setStatusTip(micro_sam_tip)
+            microSamMenu.addAction(micro_act)
+
+        self.samModelMenuAction = self.samModelMenu.menuAction()
+        self.samModelMenuAction.setText(self.tr("SAM Model"))
+        self.samModelMenuAction.setToolTip(self.tr("使用するSAMモデルを選択"))
+        return self.samModelMenuAction
+
+    def clickLoadSAM(self, model_name: str | None = None):
+        """Load the initial SAM model, or switch to a different one at runtime.
+
+        Called with no argument for the initial load (uses self.sam_model,
+        set from the --sam_model CLI arg). Called with an explicit
+        model_name from the SAM Model menu to switch models: the previous
+        adapter is unloaded (freeing GPU memory) before the new one is
+        loaded, so a stale embedding can never be reused across models.
+        """
+        target_model = model_name or getattr(self, "sam_model", "large")
+        if target_model not in SAM2_MODEL_SPECS:
+            QMessageBox.warning(self, "警告", f"不明なSAMモデルです: {target_model}")
+            return
+        if self.segmenter is not None and self.segmenter.name == target_model:
+            return  # already the active model; nothing to do
+
+        self._setSamModelMenuEnabled(False)
+        self.actions.promptSeg.setEnabled(False)
+        try:
+            if self.segmenter is not None:
+                self.segmenter.unload()
+                self.segmenter = None
+            print(f"SAM2モデルを読み込みます: {target_model} "
+                  f"({SAM2_MODEL_SPECS[target_model].checkpoint_path})")
+            new_segmenter = Sam2Adapter(SAM2_MODEL_SPECS[target_model])
+            new_segmenter.load()
+        except (NotInstalledError, NotImplementedError) as e:
+            # Expected, user-facing conditions (e.g. micro-sam not installed).
+            QMessageBox.warning(self, "警告", str(e))
+            self._setSamModelMenuEnabled(True)
+            return
+        except Exception as e:
+            # Anything else (Hydra config errors, CUDA OOM, missing
+            # checkpoint file, ...) still must not crash the GUI or leave
+            # the toolbar stuck disabled.
+            QMessageBox.critical(self, "エラー", f"SAMモデルの読み込みに失敗しました: {e}")
+            self._setSamModelMenuEnabled(True)
+            return
+
+        self.segmenter = new_segmenter
+        self.sam_model = target_model
+        self._syncSamModelMenuChecked()
         self.actions.promptSeg.setEnabled(True)
-    
+        self._setSamModelMenuEnabled(True)
+
+    def _setSamModelMenuEnabled(self, enabled: bool) -> None:
+        """Enable/disable the SAM Model menu while a load/switch is in progress."""
+        if getattr(self, "samModelMenuAction", None) is not None:
+            self.samModelMenuAction.setEnabled(enabled)
+
+    def _syncSamModelMenuChecked(self) -> None:
+        """Reflect the currently active model in the SAM Model menu's check state."""
+        for name, action in getattr(self, "samModelActions", {}).items():
+            action.setChecked(name == self.sam_model)
+
     def clickAutoSeg(self):
         pass
     
@@ -1533,17 +1609,16 @@ class MainWindow(QMainWindow):
 
     def clickManualSegBBox(self):
         Box = self.canvas.currentBox
-        if self.predictor is None or self.current_img == '' or Box == None:
+        if self.segmenter is None or self.current_img == '' or Box == None:
             return
         # Use .copy() to ensure the array is contiguous with positive strides
         img = cv2.imread(self.current_img)[:,:,::-1].copy()
         rh, rw = img.shape[:2]
         input_box = np.array([Box[0].x(), Box[0].y(), Box[1].x(), Box[1].y()])
         img, input_box, _ = self.transform_input(img, box=input_box)
-        if self.image_encoded_flag == False:
-            self.predictor.set_image(img)
-            self.image_encoded_flag = True
-        masks_sam_raw, iou_prediction, _ = self.predictor.predict(
+        image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
+        self.segmenter.set_image(img, image_key)
+        masks_sam_raw, iou_prediction, _ = self.segmenter.predict(
             point_coords=None,
             point_labels=None,
             box=input_box[None, :],
@@ -1617,7 +1692,7 @@ class MainWindow(QMainWindow):
     def clickManualSegBox(self):
         ClickPos = self.canvas.currentPos
         ClickNeg = self.canvas.currentNeg
-        if self.predictor is None or self.current_img == '' or (ClickPos == None and ClickNeg == None):
+        if self.segmenter is None or self.current_img == '' or (ClickPos == None and ClickNeg == None):
             return
         img = cv2.imread(self.current_img)[:,:,::-1].copy()
         rh, rw = img.shape[:2]
@@ -1642,10 +1717,9 @@ class MainWindow(QMainWindow):
 
         img, _, input_clicks = self.transform_input(img, points=input_clicks)
 
-        if self.image_encoded_flag == False:
-            self.predictor.set_image(img)
-            self.image_encoded_flag = True
-        masks_sam_raw, iou_prediction, _ = self.predictor.predict(
+        image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
+        self.segmenter.set_image(img, image_key)
+        masks_sam_raw, iou_prediction, _ = self.segmenter.predict(
             point_coords=input_clicks,
             point_labels=input_types,
             multimask_output=True,
@@ -2540,17 +2614,16 @@ class MainWindow(QMainWindow):
         
         # SAMでsecondaryマスクを取得
         secondary_best_mask = None
-        if self.predictor is not None and self.current_img:
+        if self.segmenter is not None and self.current_img:
             img = cv2.imread(self.current_img)[:,:,::-1].copy()
             rh, rw = img.shape[:2]
             input_box = bbox
             img, input_box, _ = self.transform_input(img, box=input_box)
-            
-            if not self.image_encoded_flag:
-                self.predictor.set_image(img)
-                self.image_encoded_flag = True
-                
-            masks, iou_prediction, _ = self.predictor.predict(
+
+            image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
+            self.segmenter.set_image(img, image_key)
+
+            masks, iou_prediction, _ = self.segmenter.predict(
                 point_coords=None,
                 point_labels=None,
                 box=input_box[None, :],
@@ -3243,6 +3316,13 @@ class MainWindow(QMainWindow):
             # If no valid_contours, filtered_reconstructed_masks[i] remains all zeros, which is correct (empty mask)
                 
         return filtered_reconstructed_masks
+
+    def closeEvent(self, event):
+        """Release the active SAM adapter (predictor, model, GPU memory) on exit."""
+        if self.segmenter is not None:
+            self.segmenter.unload()
+            self.segmenter = None
+        super().closeEvent(event)
 
 def get_parser():
     parser = argparse.ArgumentParser(description="pixel annotator by GroundedSAM")
