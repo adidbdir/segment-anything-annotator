@@ -43,12 +43,16 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Hashable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+if TYPE_CHECKING:
+    from auto_annotation import AmgParams, AutoMask
 
 DEFAULT_EMBEDDING_CACHE_SIZE = 1
 HASH_DIGEST_SIZE = 32
@@ -173,7 +177,7 @@ class CacheKey:
 
 
 PredictionResult = tuple[np.ndarray, np.ndarray, np.ndarray]
-AutoSegmentationResult = list[dict[str, object]]
+AutoSegmentationResult = list["AutoMask"]
 
 
 class SegmenterAdapter(ABC):
@@ -218,12 +222,16 @@ class SegmenterAdapter(ABC):
         """Release the predictor, model, cached embeddings, and GPU memory."""
 
     def generate_auto(
-        self, image_np: np.ndarray, image_key: ImageKey
+        self,
+        image_np: np.ndarray,
+        image_key: ImageKey,
+        *,
+        params: "AmgParams | None" = None,
     ) -> AutoSegmentationResult:
-        """Hook for future automatic mask generation (AMG).
+        """Generate automatic masks when the backend supports AMG.
 
-        Not implemented in Phase 1; ``clickAutoSeg`` remains a stub in
-        ``0_annotator_sam2.py`` and does not call this method yet.
+        Implementations return ``AutoMask`` objects whose ``points`` are ready
+        for direct conversion to annotator polygons.
         """
         raise NotImplementedError(
             f"{self.name} は自動セグメンテーション(AMG)にまだ対応していません。"
@@ -319,6 +327,33 @@ class Sam2Adapter(SegmenterAdapter):
             box=box,
             multimask_output=multimask_output,
         )
+
+    def generate_auto(
+        self,
+        image_np: np.ndarray,
+        image_key: ImageKey,
+        *,
+        params: "AmgParams | None" = None,
+    ) -> AutoSegmentationResult:
+        """Run SAM2 AMG with the already-loaded model instance.
+
+        ``image_key`` is accepted for adapter API consistency. AMG computes
+        its own dense image embedding and does not use the prompt predictor's
+        embedding cache.
+        """
+        if self._sam is None:
+            raise RuntimeError(
+                f"SAM2 model ({self.name}) is not loaded; call load() first."
+            )
+
+        from auto_annotation import AmgParams, Sam2AmgAutoAnnotator
+
+        resolved_params = params or AmgParams()
+        annotator = Sam2AmgAutoAnnotator.from_model(
+            self._sam,
+            resolved_params,
+        )
+        return annotator.generate(image_np)
 
     def unload(self) -> None:
         self._embedding_cache.clear()

@@ -57,9 +57,20 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+from auto_annotation import AmgParams
 from src.models.crystallization_analysis import CrystallizationAnalysis
 
 LABEL_COLORMAP = imgviz.label_colormap()
+
+AUTO_SEG_MIN_POINTS_PER_SIDE = 1
+AUTO_SEG_MAX_POINTS_PER_SIDE = 256
+AUTO_SEG_MIN_REGION_AREA = 0
+AUTO_SEG_MAX_REGION_AREA = 1_000_000_000
+AUTO_SEG_THRESHOLD_MIN = 0.0
+AUTO_SEG_THRESHOLD_MAX = 1.0
+AUTO_SEG_THRESHOLD_DECIMALS = 2
+AUTO_SEG_THRESHOLD_STEP = 0.01
+MIN_AUTO_SEG_POLYGON_POINTS = 3
 
 class MainWindow(QMainWindow):
 
@@ -455,7 +466,7 @@ class MainWindow(QMainWindow):
             saveDirectory=saveDirectory,
             switchClass=self.switchClass,
             loadSAM=LoadSAM,
-            #autoSeg=AutoSeg,
+            autoSeg=AutoSeg,
             promptSeg=promptSeg,
             cleanPrompt=cleanPrompt,
             createMode=createMode,
@@ -496,7 +507,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addAction(saveDirectory)
         self.toolbar.addAction(self.switchClass)
         self.toolbar.addAction(LoadSAM)
-        #self.toolbar.addAction(AutoSeg)
+        self.toolbar.addAction(AutoSeg)
         self.toolbar.addAction(promptSeg)
         self.toolbar.addAction(cleanPrompt)
         self.toolbar.addAction(createMode)
@@ -1454,12 +1465,14 @@ class MainWindow(QMainWindow):
         """
         target_model = model_name or getattr(self, "sam_model", "large")
         if target_model not in SAM2_MODEL_SPECS:
+            self.actions.autoSeg.setEnabled(False)
             QMessageBox.warning(self, "警告", f"不明なSAMモデルです: {target_model}")
             return
         if self.segmenter is not None and self.segmenter.name == target_model:
             return  # already the active model; nothing to do
 
         self._setSamModelMenuEnabled(False)
+        self.actions.autoSeg.setEnabled(False)
         self.actions.promptSeg.setEnabled(False)
         try:
             if self.segmenter is not None:
@@ -1485,6 +1498,7 @@ class MainWindow(QMainWindow):
         self.segmenter = new_segmenter
         self.sam_model = target_model
         self._syncSamModelMenuChecked()
+        self.actions.autoSeg.setEnabled(True)
         self.actions.promptSeg.setEnabled(True)
         self._setSamModelMenuEnabled(True)
 
@@ -1498,8 +1512,177 @@ class MainWindow(QMainWindow):
         for name, action in getattr(self, "samModelActions", {}).items():
             action.setChecked(name == self.sam_model)
 
-    def clickAutoSeg(self):
-        pass
+    def clickAutoSeg(self) -> None:
+        """Generate editable primary polygons with SAM2 AMG."""
+        if self.segmenter is None:
+            QMessageBox.warning(self, "警告", "SAMモデルを読み込んでください")
+            return
+        if self.current_img == "":
+            QMessageBox.warning(self, "警告", "画像を開いてください")
+            return
+
+        params = self._showAutoSegParamsDialog()
+        if params is None:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            new_shapes = self._runAutoSegOnCurrentImage(params)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"自動セグメンテーションに失敗しました: {exc}",
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not new_shapes:
+            QMessageBox.information(
+                self,
+                "自動セグメンテーション",
+                "条件に合うマスクは見つかりませんでした。",
+            )
+
+    def _showAutoSegParamsDialog(self) -> AmgParams | None:
+        """Show AMG parameter controls and return the accepted values."""
+        defaults = AmgParams()
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("自動セグメンテーション設定")
+        form_layout = QtWidgets.QFormLayout(dialog)
+
+        points_per_side = QtWidgets.QSpinBox(dialog)
+        points_per_side.setRange(
+            AUTO_SEG_MIN_POINTS_PER_SIDE,
+            AUTO_SEG_MAX_POINTS_PER_SIDE,
+        )
+        points_per_side.setValue(defaults.points_per_side)
+        form_layout.addRow("一辺あたりの点数", points_per_side)
+
+        pred_iou_thresh = self._createAutoSegThresholdSpinBox(
+            dialog,
+            defaults.pred_iou_thresh,
+        )
+        form_layout.addRow("IoU予測しきい値", pred_iou_thresh)
+
+        stability_score_thresh = self._createAutoSegThresholdSpinBox(
+            dialog,
+            defaults.stability_score_thresh,
+        )
+        form_layout.addRow("安定性スコアしきい値", stability_score_thresh)
+
+        min_mask_region_area = QtWidgets.QSpinBox(dialog)
+        min_mask_region_area.setRange(
+            AUTO_SEG_MIN_REGION_AREA,
+            AUTO_SEG_MAX_REGION_AREA,
+        )
+        min_mask_region_area.setValue(defaults.min_mask_region_area)
+        form_layout.addRow("最小マスク面積", min_mask_region_area)
+
+        box_nms_thresh = self._createAutoSegThresholdSpinBox(
+            dialog,
+            defaults.box_nms_thresh,
+        )
+        form_layout.addRow("Box NMSしきい値", box_nms_thresh)
+
+        buttons = QtWidgets.QDialogButtonBox(dialog)
+        run_button = buttons.addButton(
+            "自動実行",
+            QtWidgets.QDialogButtonBox.AcceptRole,
+        )
+        cancel_button = buttons.addButton(
+            "キャンセル",
+            QtWidgets.QDialogButtonBox.RejectRole,
+        )
+        run_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        form_layout.addRow(buttons)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+        return AmgParams(
+            points_per_side=points_per_side.value(),
+            pred_iou_thresh=pred_iou_thresh.value(),
+            stability_score_thresh=stability_score_thresh.value(),
+            min_mask_region_area=min_mask_region_area.value(),
+            box_nms_thresh=box_nms_thresh.value(),
+        )
+
+    def _createAutoSegThresholdSpinBox(
+        self,
+        parent: QtWidgets.QWidget,
+        value: float,
+    ) -> QtWidgets.QDoubleSpinBox:
+        """Create a consistently configured AMG threshold control."""
+        spin_box = QtWidgets.QDoubleSpinBox(parent)
+        spin_box.setRange(AUTO_SEG_THRESHOLD_MIN, AUTO_SEG_THRESHOLD_MAX)
+        spin_box.setDecimals(AUTO_SEG_THRESHOLD_DECIMALS)
+        spin_box.setSingleStep(AUTO_SEG_THRESHOLD_STEP)
+        spin_box.setValue(value)
+        return spin_box
+
+    def _runAutoSegOnCurrentImage(self, params: AmgParams) -> list[Shape]:
+        """Generate, register, and display primary polygons for the open image."""
+        if self.segmenter is None:
+            raise RuntimeError("SAMモデルが読み込まれていません。")
+        if self.current_img == "":
+            raise RuntimeError("画像が開かれていません。")
+
+        image_bgr = cv2.imread(self.current_img)
+        if image_bgr is None:
+            raise ValueError(f"画像を読み込めません: {self.current_img}")
+        image_rgb = image_bgr[:, :, ::-1].copy()
+        original_height, original_width = image_rgb.shape[:2]
+        transformed_image, _, _ = self.transform_input(image_rgb)
+        transformed_height, transformed_width = transformed_image.shape[:2]
+        image_key = build_image_key(
+            self.current_img,
+            self.keep_input_size,
+            self.max_size,
+        )
+        auto_masks = self.segmenter.generate_auto(
+            transformed_image,
+            image_key,
+            params=params,
+        )
+
+        # Use actual integer-resized dimensions so rounding in transform_input
+        # is reversed exactly enough for editable canvas-space polygons.
+        x_scale = original_width / transformed_width
+        y_scale = original_height / transformed_height
+        polygon_points = [
+            mask.points
+            for mask in auto_masks
+            if mask.points is not None
+            and len(mask.points) >= MIN_AUTO_SEG_POLYGON_POINTS
+        ]
+        first_group_id = self.getMaxId() + 1
+        new_shapes = []
+        for group_offset, points in enumerate(polygon_points):
+            shape = Shape(
+                label="primary",
+                shape_type="polygon",
+                group_id=first_group_id + group_offset,
+                flags={},
+            )
+            for x_position, y_position in points:
+                shape.addPoint(
+                    QtCore.QPointF(
+                        x_position * x_scale,
+                        y_position * y_scale,
+                    )
+                )
+            shape.close()
+            new_shapes.append(shape)
+
+        if not new_shapes:
+            return []
+        for shape in new_shapes:
+            self.addLabel(shape)
+        self.canvas.loadShapes(new_shapes, replace=False)
+        self.setDirty()
+        return new_shapes
     
     def getMaxId(self):
         max_id = -1
