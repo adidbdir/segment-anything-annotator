@@ -13,7 +13,17 @@ import argparse
 import threading
 import numpy as np
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QFileDialog, QProgressBar, QScrollArea, QDockWidget, QMessageBox
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QPushButton,
+    QLabel,
+    QFileDialog,
+    QProgressBar,
+    QScrollArea,
+    QDockWidget,
+    QMessageBox,
+)
 from PyQt5.QtGui import QPixmap, QIcon, QImage
 from PyQt5.Qt import QSize
 from qtpy.QtCore import QEventLoop, QObject, QThread, Qt, Signal
@@ -22,7 +32,13 @@ from qtpy import QtGui, QtWidgets
 from canvas import Canvas
 import utils
 
-from labelme.widgets import UniqueLabelQListWidget, LabelDialog, LabelListWidget, LabelListWidgetItem, ZoomWidget
+from labelme.widgets import (
+    UniqueLabelQListWidget,
+    LabelDialog,
+    LabelListWidget,
+    LabelListWidgetItem,
+    ZoomWidget,
+)
 from labelme import PY2
 from labelme.label_file import LabelFile
 
@@ -32,17 +48,24 @@ from shape import Shape
 from PIL import Image
 
 from collections import namedtuple
-Click = namedtuple('Click', ['is_positive', 'coords'])
+
+Click = namedtuple("Click", ["is_positive", "coords"])
 
 # from segment_anything import sam_model_registry, SamPredictor
 # sys.path.append('../sam2')
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'external', 'sam2')))
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "external", "sam2"))
+)
 from sam_adapter import (  # noqa: E402
+    MATSAM_MODEL_NAMES,
+    MATSAM_MODEL_SPECS,
     MICRO_SAM_CHECKPOINT_SIZE_MB,
     MICRO_SAM_MODEL_NAMES,
     MICRO_SAM_MODEL_SPECS,
     SAM2_MODEL_SPECS,
     ImageKey,
+    MatSamAdapter,
+    MatSamParams,
     MicroSamAdapter,
     MicroSamDownloadCancelledError,
     MicroSamParams,
@@ -50,8 +73,10 @@ from sam_adapter import (  # noqa: E402
     Sam2Adapter,
     SegmenterAdapter,
     build_image_key,
+    matsam_interpreter_exists,
     micro_sam_interpreter_exists,
 )
+from matsam_client import MatSamClientError, MatSamWorkerClient  # noqa: E402
 from micro_sam_client import MicroSamClientError, MicroSamWorkerClient  # noqa: E402
 import csv_exporter  # noqa: E402
 
@@ -76,6 +101,11 @@ AUTO_SEG_SMOOTHING_MAX = 100.0
 AUTO_SEG_SMOOTHING_DECIMALS = 2
 AUTO_SEG_SMOOTHING_STEP = 0.1
 AUTO_SEG_MAX_BATCH_SIZE = 1024
+AUTO_SEG_MAX_LAYERS = 10
+AUTO_SEG_MAX_SCALES = 10
+AUTO_SEG_MAX_IMAGE_SIZE = 32768
+MATSAM_METHOD_TYPE_MIN = 1
+MATSAM_METHOD_TYPE_MAX = 2
 MIN_AUTO_SEG_POLYGON_POINTS = 3
 
 
@@ -92,11 +122,13 @@ class _SamLoadWorker(QObject):
         new_segmenter: SegmenterAdapter,
         old_segmenter: SegmenterAdapter | None,
         micro_sam_client: MicroSamWorkerClient | None = None,
+        matsam_client: MatSamWorkerClient | None = None,
     ) -> None:
         super().__init__()
         self.new_segmenter = new_segmenter
         self.old_segmenter = old_segmenter
         self.micro_sam_client = micro_sam_client
+        self.matsam_client = matsam_client
         self._cancel_requested = threading.Event()
         self._result_decided = threading.Event()
         self._decision_lock = threading.Lock()
@@ -129,6 +161,8 @@ class _SamLoadWorker(QObject):
                     confirm_download=self._confirm_download,
                     client=self.micro_sam_client,
                 )
+            elif isinstance(self.new_segmenter, MatSamAdapter):
+                self.new_segmenter.load(client=self.matsam_client)
             else:
                 self.new_segmenter.load()
             if self._cancel_requested.is_set():
@@ -161,18 +195,34 @@ class _SamLoadWorker(QObject):
             self.new_segmenter.unload()
         except Exception:  # noqa: BLE001 - teardown must not mask load failure
             pass
+        if self.matsam_client is not None and self.matsam_client.is_alive:
+            self.matsam_client.terminate()
 
 
 class MainWindow(QMainWindow):
-
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = 0, 1, 2
 
-    def __init__(self, parent=None, global_w=1000, global_h=1800, model_type='vit_b', keep_input_size=True, max_size=1080, category_file='primary.txt',
-                 save_mask=True, save_bbox=True, save_labels=True, image_directory=None, sam_model='large'):
+    def __init__(
+        self,
+        parent=None,
+        global_w=1000,
+        global_h=1800,
+        model_type="vit_b",
+        keep_input_size=True,
+        max_size=1080,
+        category_file="primary.txt",
+        save_mask=True,
+        save_bbox=True,
+        save_labels=True,
+        image_directory=None,
+        sam_model="large",
+    ):
         super(MainWindow, self).__init__(parent)
         self.resize(global_w, global_h)
         self.model_type = model_type
-        self.sam_model = sam_model  # 読み込むSAM2モデルのサイズ (tiny/small/base_plus/large)
+        self.sam_model = (
+            sam_model  # 読み込むSAM2モデルのサイズ (tiny/small/base_plus/large)
+        )
         self.keep_input_size = keep_input_size
         self.max_size = float(max_size)
         self.category_file = category_file
@@ -189,20 +239,22 @@ class MainWindow(QMainWindow):
         self.scalebar_image = None  # スケールバー画像へのパス
         self.scale_set = False  # スケールが設定されたかどうか
 
-        self.setWindowTitle('segment-anything-annotator')
-        self.canvas = Canvas(self,
+        self.setWindowTitle("segment-anything-annotator")
+        self.canvas = Canvas(
+            self,
             epsilon=10.0,
-            double_click='close',
+            double_click="close",
             num_backups=10,
             app=self,
         )
 
-        
         self._noSelectionSlot = False
-        self.base_output_dir = 'output'  # ベース出力ディレクトリ
-        self.current_output_dir = 'output'  # 実際の出力ディレクトリ（入力フォルダ名含む）
+        self.base_output_dir = "output"  # ベース出力ディレクトリ
+        self.current_output_dir = (
+            "output"  # 実際の出力ディレクトリ（入力フォルダ名含む）
+        )
         os.makedirs(self.base_output_dir, exist_ok=True)
-        self.current_output_filename = ''
+        self.current_output_filename = ""
         self.canvas.zoomRequest.connect(self.zoomRequest)
 
         self.memory_shapes = []
@@ -245,18 +297,15 @@ class MainWindow(QMainWindow):
 
         self.uniqLabelList = UniqueLabelQListWidget()
         self.uniqLabelList.setToolTip(
-            self.tr(
-                "Select label to start annotating for it. "
-                "Press 'Esc' to deselect."
-            )
+            self.tr("Select label to start annotating for it. Press 'Esc' to deselect.")
         )
         self.labelDialog = LabelDialog(
             parent=self,
             labels=[],
             sort_labels=False,
             show_text_field=True,
-            completion='contains',
-            fit_to_content={'column': True, 'row': False},
+            completion="contains",
+            fit_to_content={"column": True, "row": False},
         )
 
         self.labelList = LabelListWidget()
@@ -265,59 +314,64 @@ class MainWindow(QMainWindow):
         self.labelList.itemChanged.connect(self.labelItemChanged)
         self.labelList.itemDropped.connect(self.labelOrderChanged)
 
-        self.shape_dock = QDockWidget(
-            self.tr("Polygon Labels"), self
-        )
+        self.shape_dock = QDockWidget(self.tr("Polygon Labels"), self)
         self.shape_dock.setObjectName("Labels")
         self.shape_dock.setWidget(self.labelList)
 
-        self.category_list = [i.strip() for i in open('categories.txt', 'r', encoding='utf-8').readlines()]
+        self.category_list = [
+            i.strip() for i in open("categories.txt", "r", encoding="utf-8").readlines()
+        ]
         self.labelDialog = LabelDialog(
             parent=self,
             labels=self.category_list,
             sort_labels=False,
             show_text_field=True,
-            completion='contains',
-            fit_to_content={'column': True, 'row': False},
+            completion="contains",
+            fit_to_content={"column": True, "row": False},
         )
         self.zoom_values = {}
-        self.video_directory = ''
+        self.video_directory = ""
         self.video_list = []
         self.video_len = len(self.video_list)
 
         self.img_list = []
         self.img_len = len(self.img_list)
         self.current_img_index = 0
-        self.current_img = ''
-        self.current_img_data = ''
-        self.input_folder_name = ''  # 入力フォルダ名を保存
+        self.current_img = ""
+        self.current_img_data = ""
+        self.input_folder_name = ""  # 入力フォルダ名を保存
 
-        self.button_next = QPushButton('Next Image', self)
+        self.button_next = QPushButton("Next Image", self)
         self.button_next.clicked.connect(self.clickButtonNext)
-        self.button_last = QPushButton('Last Image', self)
+        self.button_last = QPushButton("Last Image", self)
         self.button_last.clicked.connect(self.clickButtonLast)
 
         self.img_progress_bar = QProgressBar(self)
         self.img_progress_bar.setMinimum(0)
         self.img_progress_bar.setMaximum(1)
         self.img_progress_bar.setValue(0)
-        self.button_proposal1 = QPushButton('Proposal1', self)
+        self.button_proposal1 = QPushButton("Proposal1", self)
         self.button_proposal1.clicked.connect(self.choose_proposal1)
-        self.button_proposal1.setShortcut('1')
-        self.button_proposal2 = QPushButton('Proposal2', self)
+        self.button_proposal1.setShortcut("1")
+        self.button_proposal2 = QPushButton("Proposal2", self)
         self.button_proposal2.clicked.connect(self.choose_proposal2)
-        self.button_proposal2.setShortcut('2')
-        self.button_proposal3 = QPushButton('Proposal3', self)
+        self.button_proposal2.setShortcut("2")
+        self.button_proposal3 = QPushButton("Proposal3", self)
         self.button_proposal3.clicked.connect(self.choose_proposal3)
-        self.button_proposal3.setShortcut('3')
-        self.button_proposal4 = QPushButton('Proposal4', self)
+        self.button_proposal3.setShortcut("3")
+        self.button_proposal4 = QPushButton("Proposal4", self)
         self.button_proposal4.clicked.connect(self.choose_proposal4)
-        self.button_proposal4.setShortcut('4')
-        self.button_proposal_list = [self.button_proposal1, self.button_proposal2, self.button_proposal3, self.button_proposal4]
-        
+        self.button_proposal4.setShortcut("4")
+        self.button_proposal_list = [
+            self.button_proposal1,
+            self.button_proposal2,
+            self.button_proposal3,
+            self.button_proposal4,
+        ]
+
         self.class_on_flag = True
         self.class_on_text = QLabel("Class On", self)
-        
+
         # secondary のグループ分けを行う
         self.grouping_complete = False  # グループ分けフラグを追加
         self.grouped_segments = []  # グループ分けされたセグメントを保持するリスト
@@ -327,28 +381,28 @@ class MainWindow(QMainWindow):
         # time
         self.s = time.time()
 
-        #naive layout
+        # naive layout
         self.scrollArea.move(int(0.02 * global_w), int(0.08 * global_h))
         self.scrollArea.resize(int(0.75 * global_w), int(0.7 * global_h))
         self.shape_dock.move(int(0.79 * global_w), int(0.08 * global_h))
         self.shape_dock.resize(int(0.2 * global_w), int(0.7 * global_h))
         self.button_next.move(int(0.195 * global_w), int(0.85 * global_h))
-        self.button_next.resize(int(0.1 * global_w),int(0.04 * global_h))
+        self.button_next.resize(int(0.1 * global_w), int(0.04 * global_h))
         self.button_last.move(int(0.025 * global_w), int(0.85 * global_h))
-        self.button_last.resize(int(0.1 * global_w),int(0.04 * global_h))
+        self.button_last.resize(int(0.1 * global_w), int(0.04 * global_h))
         # self.class_on_text.move(int(0.01 * global_w), int(0.9 * global_h))
         self.img_progress_bar.move(int(0.01 * global_w), int(0.8 * global_h))
-        self.img_progress_bar.resize(int(0.3 * global_w),int(0.04 * global_h))
-        
-        self.button_proposal1.resize(int(0.17 * global_w),int(0.14 * global_h))
+        self.img_progress_bar.resize(int(0.3 * global_w), int(0.04 * global_h))
+
+        self.button_proposal1.resize(int(0.17 * global_w), int(0.14 * global_h))
         self.button_proposal1.move(int(0.33 * global_w), int(0.8 * global_h))
-        self.button_proposal2.resize(int(0.17 * global_w),int(0.14 * global_h))
+        self.button_proposal2.resize(int(0.17 * global_w), int(0.14 * global_h))
         self.button_proposal2.move(int(0.50 * global_w), int(0.8 * global_h))
-        self.button_proposal3.resize(int(0.17 * global_w),int(0.14 * global_h))
+        self.button_proposal3.resize(int(0.17 * global_w), int(0.14 * global_h))
         self.button_proposal3.move(int(0.67 * global_w), int(0.8 * global_h))
-        self.button_proposal4.resize(int(0.17 * global_w),int(0.14 * global_h))
+        self.button_proposal4.resize(int(0.17 * global_w), int(0.14 * global_h))
         self.button_proposal4.move(int(0.84 * global_w), int(0.8 * global_h))
-        
+
         # add:隠しでパラメータ保持用の QLineEdit を作成（初期値は空）
         self.date_edit = QtWidgets.QLineEdit()
         self.experimenter_edit = QtWidgets.QLineEdit()
@@ -358,12 +412,12 @@ class MainWindow(QMainWindow):
         self.crystal_time_edit = QtWidgets.QLineEdit()
         self.suspension_density_edit = QtWidgets.QLineEdit()
         self.image_scaler_edit = QtWidgets.QLineEdit()
-        
+
         self.zoomWidget = ZoomWidget()
         self.image_directory = image_directory
 
         action = functools.partial(utils.newAction, self)
-        
+
         experimentParamsAction = action(
             self.tr("Experiment Params"),
             self.showExperimentParamsDialog,
@@ -375,7 +429,7 @@ class MainWindow(QMainWindow):
         GroupSeg = action(
             self.tr("Group Seg"),
             lambda: self.clickGroupSeg(),
-            'g',
+            "g",
             "objects",
             self.tr("Group Seg"),
             enabled=True,
@@ -383,7 +437,7 @@ class MainWindow(QMainWindow):
         categoryFile = action(
             self.tr("Category File"),
             lambda: self.clickCategoryChoose(),
-            'c',
+            "c",
             "objects",
             self.tr("Category File"),
             enabled=True,
@@ -391,7 +445,7 @@ class MainWindow(QMainWindow):
         imageDirectory = action(
             self.tr("Image Directory"),
             lambda: self.clickFileChoose(),
-            'None',
+            "None",
             "objects",
             self.tr("Image Directory"),
             enabled=True,
@@ -400,7 +454,7 @@ class MainWindow(QMainWindow):
         AutoSeg = action(
             self.tr("AutoSeg"),
             lambda: self.clickAutoSeg(),
-            'None',
+            "None",
             "objects",
             self.tr("AutoSeg"),
             enabled=False,
@@ -408,7 +462,7 @@ class MainWindow(QMainWindow):
         promptSeg = action(
             self.tr("Accept"),
             lambda: self.addSamMask(),
-            'a',
+            "a",
             "objects",
             self.tr("Accept"),
             enabled=False,
@@ -417,7 +471,7 @@ class MainWindow(QMainWindow):
         saveDirectory = action(
             self.tr("Save Directory"),
             lambda: self.clickSaveChoose(),
-            'None',
+            "None",
             "objects",
             self.tr("Save Directory"),
             enabled=True,
@@ -426,7 +480,7 @@ class MainWindow(QMainWindow):
         createMode = action(
             self.tr("Manual Polygons"),
             lambda: self.toggleDrawMode(False, createMode="polygon"),
-            'Ctrl+W',
+            "Ctrl+W",
             "objects",
             self.tr("Start drawing polygons"),
             enabled=True,
@@ -434,7 +488,7 @@ class MainWindow(QMainWindow):
         createPointMode = action(
             self.tr("Point Prompt"),
             lambda: self.toggleDrawMode(False, createMode="point"),
-            'p',
+            "p",
             "objects",
             self.tr("Point Prompt"),
             enabled=True,
@@ -442,7 +496,7 @@ class MainWindow(QMainWindow):
         createRectangleMode = action(
             self.tr("Box Prompt"),
             lambda: self.toggleDrawMode(False, createMode="rectangle"),
-            'b',
+            "b",
             "objects",
             self.tr("Box Prompt"),
             enabled=True,
@@ -450,16 +504,16 @@ class MainWindow(QMainWindow):
         cleanPrompt = action(
             self.tr("Reject"),
             lambda: self.cleanPrompt(),
-            'r',
+            "r",
             "objects",
             self.tr("Reject"),
             enabled=True,
         )
-        
+
         self.switchClass = action(
             self.tr("Class On/Off"),
             lambda: self.clickSwitchClass(),
-            'none',
+            "none",
             "objects",
             self.tr("Class On/Off"),
             enabled=True,
@@ -468,7 +522,7 @@ class MainWindow(QMainWindow):
         editMode = action(
             self.tr("Edit Polygons"),
             self.setEditMode,
-            'e',
+            "e",
             "edit",
             self.tr("Move and edit the selected polygons"),
             enabled=False,
@@ -476,7 +530,7 @@ class MainWindow(QMainWindow):
         saveAs = action(
             self.tr("&Save As"),
             self.saveFileAs,
-            'ALT+s',
+            "ALT+s",
             "save-as",
             self.tr("Save labels to a different file"),
             enabled=True,
@@ -485,7 +539,7 @@ class MainWindow(QMainWindow):
         undoLastPoint = action(
             self.tr("Undo last point"),
             self.canvas.undoLastPoint,
-            'U',
+            "U",
             "undo",
             self.tr("Undo last drawn point"),
             enabled=False,
@@ -509,7 +563,7 @@ class MainWindow(QMainWindow):
         undo = action(
             self.tr("Undo"),
             self.undoShapeEdit,
-            'Ctrl+U',
+            "Ctrl+U",
             "undo",
             self.tr("Undo last add and edit of shape"),
             enabled=False,
@@ -518,7 +572,7 @@ class MainWindow(QMainWindow):
         save = action(
             self.tr("&Save"),
             self.saveFile,
-            'S',
+            "S",
             "save",
             self.tr("Save labels to file"),
             enabled=False,
@@ -527,7 +581,7 @@ class MainWindow(QMainWindow):
         delete = action(
             self.tr("Delete Polygons"),
             self.deleteSelectedShape,
-            'd',
+            "d",
             "cancel",
             self.tr("Delete the selected polygons"),
             enabled=False,
@@ -535,7 +589,7 @@ class MainWindow(QMainWindow):
         duplicate = action(
             self.tr("Duplicate Polygons"),
             self.duplicateSelectedShape,
-            'None',
+            "None",
             "copy",
             self.tr("Create a duplicate of the selected polygons"),
             enabled=False,
@@ -543,20 +597,19 @@ class MainWindow(QMainWindow):
         reduce_point = action(
             self.tr("Reduce Points"),
             self.reducePoint,
-            'None',
+            "None",
             "copy",
             self.tr("Reduce Points"),
             enabled=True,
-        )            
+        )
         edit = action(
             self.tr("&Edit Label"),
             self.editLabel,
-            'None',
+            "None",
             "edit",
             self.tr("Modify the label of the selected polygon"),
             enabled=False,
         )
-        
 
         self.actions = utils.struct(
             categoryFile=categoryFile,
@@ -585,7 +638,7 @@ class MainWindow(QMainWindow):
                 undoLastPoint,
                 undo,
                 save,
-            )
+            ),
         )
 
         # Custom context menu for the canvas widget:
@@ -598,7 +651,7 @@ class MainWindow(QMainWindow):
             ),
         )
 
-        self.toolbar = self.addToolBar('Tool')
+        self.toolbar = self.addToolBar("Tool")
         self.toolbar.addAction(experimentParamsAction)
         self.toolbar.addAction(categoryFile)
         self.toolbar.addAction(imageDirectory)
@@ -631,9 +684,9 @@ class MainWindow(QMainWindow):
                     "{} from the canvas."
                 )
             ).format(
-                #utils.fmtShortcut(
+                # utils.fmtShortcut(
                 #    "{},{}".format(shortcuts["zoom_in"], shortcuts["zoom_out"])
-                #),
+                # ),
                 utils.fmtShortcut(self.tr("Ctrl+Wheel")),
             )
         )
@@ -641,20 +694,22 @@ class MainWindow(QMainWindow):
 
         self.zoomWidget.valueChanged.connect(self.paintCanvas)
         self.canvas.actions = self.actions
-    
+
         # 初期化時にカテゴリファイルを読み込む
         # 一つのラベルしかない場合は自動的にそのラベルを設定
         # acceptを押した際に自動でラベルが設定されるように
         # SAMの読みこみを実行する
-        # 複数の場合はNoneに設定   
+        # 複数の場合はNoneに設定
         if self.category_file and os.path.exists(self.category_file):
             try:
-                with open(self.category_file, 'r') as f:
+                with open(self.category_file, "r") as f:
                     data = f.readlines()
                     self.category_list = [i.strip() for i in data]
                     self.category_list.sort()
                     if len(self.category_list) == 1:
-                        self.default_label = self.category_list[0]  # 自動的にそのラベルを設定
+                        self.default_label = self.category_list[
+                            0
+                        ]  # 自動的にそのラベルを設定
                         self.class_on_flag = False
                         # print(f"カテゴリファイルを読み込みました: {self.category_file}")
                         self.clickLoadSAM()
@@ -662,63 +717,71 @@ class MainWindow(QMainWindow):
                         self.default_label = None  # 複数の場合はNoneに設定
             except Exception as e:
                 print(f"カテゴリファイルの読み込みに失敗しました: {e}")
-        
+
         # 保存設定の保持
         self.save_mask = save_mask
         self.save_bbox = False  # bbox出力は無効化
         self.save_labels = save_labels
-        
+
         # 保存設定用チェックボックス
         self.save_mask_checkbox = QtWidgets.QCheckBox(self.tr("Save Mask Images"), self)
         self.save_mask_checkbox.setChecked(self.save_mask)
         self.save_mask_checkbox.stateChanged.connect(self.updateSaveMaskSetting)
-        
+
         self.save_bbox_checkbox = QtWidgets.QCheckBox(self.tr("Save BBox Images"), self)
         self.save_bbox_checkbox.setChecked(False)  # bbox出力は無効化
         self.save_bbox_checkbox.stateChanged.connect(self.updateSaveBBoxSetting)
-        
+
         # チェックボックスの配置
         self.save_mask_checkbox.move(int(0.01 * global_w), int(0.95 * global_h))
         self.save_bbox_checkbox.move(int(0.20 * global_w), int(0.95 * global_h))
-        
+
         # スケールバー測定関連のUIコンポーネント
-        self.scale_button = QPushButton('スケールバー測定', self)
+        self.scale_button = QPushButton("スケールバー測定", self)
         self.scale_button.clicked.connect(self.startScaleBarMode)
         self.scale_button.move(int(0.40 * global_w), int(0.95 * global_h))
         self.scale_button.resize(int(0.15 * global_w), int(0.03 * global_h))
-        
+
         self.scale_status_label = QLabel("スケール: 未設定", self)
         self.scale_status_label.move(int(0.56 * global_w), int(0.95 * global_h))
         self.scale_status_label.resize(int(0.2 * global_w), int(0.03 * global_h))
-        
+
         # スケールバー画像を自動的に探して表示するボタン
-        self.find_scalebar_button = QPushButton('スケールバー画像を検索', self)
+        self.find_scalebar_button = QPushButton("スケールバー画像を検索", self)
         self.find_scalebar_button.clicked.connect(self.findScaleBarImage)
         self.find_scalebar_button.move(int(0.77 * global_w), int(0.95 * global_h))
         self.find_scalebar_button.resize(int(0.2 * global_w), int(0.03 * global_h))
-        
+
         # 現在の画像ファイル名表示用ラベル
         self.current_filename_label = QLabel("ファイル: 未選択", self)
         self.current_filename_label.move(int(0.01 * global_w), int(0.89 * global_h))
         self.current_filename_label.resize(int(0.3 * global_w), int(0.02 * global_h))
-        self.current_filename_label.setStyleSheet("font-size: 10px; font-weight: bold; color: #333; background-color: #f0f0f0; padding: 2px;")
+        self.current_filename_label.setStyleSheet(
+            "font-size: 10px; font-weight: bold; color: #333; background-color: #f0f0f0; padding: 2px;"
+        )
         self.current_filename_label.setAlignment(Qt.AlignCenter)
-    
+
         # Add area threshold UI
         self.area_threshold = 100  # Default value
         self.area_threshold_label = QtWidgets.QLabel(self.tr("Area Threshold:"), self)
         self.area_threshold_spinbox = QtWidgets.QSpinBox(self)
         self.area_threshold_spinbox.setMinimum(0)
-        self.area_threshold_spinbox.setMaximum(1000000) # Adjust max as needed
+        self.area_threshold_spinbox.setMaximum(1000000)  # Adjust max as needed
         self.area_threshold_spinbox.setValue(self.area_threshold)
         self.area_threshold_spinbox.setSingleStep(10)
         self.area_threshold_spinbox.valueChanged.connect(self.update_area_threshold)
 
         # Layout for area threshold (example placement, adjust as needed)
         # Assuming you want to place it near other settings like save checkboxes
-        self.area_threshold_label.move(int(0.01 * global_w), int(0.92 * global_h)) # Adjust position
-        self.area_threshold_spinbox.move(int(0.12 * global_w), int(0.92 * global_h)) # Adjust position
-        self.area_threshold_spinbox.resize(int(0.07 * global_w), int(0.025 * global_h)) # Adjust size
+        self.area_threshold_label.move(
+            int(0.01 * global_w), int(0.92 * global_h)
+        )  # Adjust position
+        self.area_threshold_spinbox.move(
+            int(0.12 * global_w), int(0.92 * global_h)
+        )  # Adjust position
+        self.area_threshold_spinbox.resize(
+            int(0.07 * global_w), int(0.025 * global_h)
+        )  # Adjust size
 
     def _relative_input_name(self, directory):
         """出力ディレクトリ名を決める。入力パス中の最後の "input" 以降の相対パスを返し、
@@ -727,10 +790,12 @@ class MainWindow(QMainWindow):
         "input" が含まれない場合は末尾フォルダ名のみ（従来動作）。"""
         try:
             norm = os.path.normpath(directory)
-            parts = [p for p in norm.split(os.sep) if p not in ('', '.')]
-            if 'input' in parts:
-                idx = len(parts) - 1 - parts[::-1].index('input')  # 最後の 'input' の位置
-                rel_parts = parts[idx + 1:]
+            parts = [p for p in norm.split(os.sep) if p not in ("", ".")]
+            if "input" in parts:
+                idx = (
+                    len(parts) - 1 - parts[::-1].index("input")
+                )  # 最後の 'input' の位置
+                rel_parts = parts[idx + 1 :]
                 if rel_parts:
                     return os.path.join(*rel_parts)
         except Exception as e:
@@ -740,7 +805,9 @@ class MainWindow(QMainWindow):
     def updateOutputDirectory(self):
         """入力フォルダ名に基づいて出力ディレクトリを更新する"""
         if self.input_folder_name:
-            self.current_output_dir = os.path.join(self.base_output_dir, self.input_folder_name)
+            self.current_output_dir = os.path.join(
+                self.base_output_dir, self.input_folder_name
+            )
         else:
             self.current_output_dir = self.base_output_dir
         os.makedirs(self.current_output_dir, exist_ok=True)
@@ -771,7 +838,10 @@ class MainWindow(QMainWindow):
                 return
             os.makedirs(self.current_output_dir, exist_ok=True)
             data = {
-                "params": {key: widget.text() for key, widget in self._param_widget_map().items()},
+                "params": {
+                    key: widget.text()
+                    for key, widget in self._param_widget_map().items()
+                },
                 "scale": {
                     "scale_set": self.scale_set,
                     "scale_value": self.scale_value,
@@ -804,7 +874,9 @@ class MainWindow(QMainWindow):
                 self.scale_value = scale.get("scale_value", self.scale_value)
                 self.scale_factor = scale.get("scale_factor", self.scale_factor)
                 self.scale_unit = scale.get("scale_unit", self.scale_unit)
-                self.scale_um_per_px = scale.get("scale_um_per_px", self.scale_um_per_px)
+                self.scale_um_per_px = scale.get(
+                    "scale_um_per_px", self.scale_um_per_px
+                )
         except Exception as e:
             print(f"実験設定の復元に失敗: {e}")
 
@@ -815,7 +887,9 @@ class MainWindow(QMainWindow):
         try:
             if self.scale_set:
                 return
-            if not self.current_output_dir or not os.path.isdir(self.current_output_dir):
+            if not self.current_output_dir or not os.path.isdir(
+                self.current_output_dir
+            ):
                 return
             distinct = {}  # token(文字列) -> float値
             for f in glob.glob(os.path.join(self.current_output_dir, "*.csv")):
@@ -835,7 +909,9 @@ class MainWindow(QMainWindow):
             # スケール値が食い違う複数CSVがある場合は、どれが現在のデータのものか特定できないため
             # 誤ったスケールで測定しないよう自動復元しない（ユーザーに手動設定/測定させる）。
             if len(distinct) > 1:
-                print(f"既存CSVのスケールが複数あり曖昧なため自動復元しません: {sorted(distinct.keys())}")
+                print(
+                    f"既存CSVのスケールが複数あり曖昧なため自動復元しません: {sorted(distinct.keys())}"
+                )
                 return
             token, val = next(iter(distinct.items()))
             self.image_scaler_edit.setText(token)
@@ -884,46 +960,47 @@ class MainWindow(QMainWindow):
         self._saveFile(self.current_output_filename)
 
     def _saveFile(self, filename):
-        
+
         if self.save_labels:
             self.saveLabels(filename)
         # マスク画像の保存
         if self.save_mask:
-            filename_base = os.path.splitext(filename)[
-                0
-            ]  # 拡張子を除いたファイル名
+            filename_base = os.path.splitext(filename)[0]  # 拡張子を除いたファイル名
             self.saveMaskAndBBoxImages(filename_base)
-        
+
         # すべての二次粒子の可視化
         self.visualizeAllSecondaryParticles()
-        
+
         self.setClean()
 
     def updateSaveMaskSetting(self, state):
-        self.save_mask = (state == Qt.Checked)
-        
+        self.save_mask = state == Qt.Checked
+
     def updateSaveBBoxSetting(self, state):
-        self.save_bbox = (state == Qt.Checked)
+        self.save_bbox = state == Qt.Checked
 
     def saveLabels(self, filename):
         def format_shape(s):
             data = s.other_data.copy()
-            
+
             # SAMマスクがある場合は、マスクから輪郭を抽出してpointsとして使用
-            if hasattr(s, 'original_sam_mask'):
+            if hasattr(s, "original_sam_mask"):
                 # SAMマスクから輪郭を抽出
                 contours = self.mask2polygon(s.original_sam_mask)
                 if contours is not None and len(contours) > 0:
                     # 最大の輪郭を使用
                     largest_contour = max(contours, key=cv2.contourArea)
-                    points = [[float(point[0][0]), float(point[0][1])] for point in largest_contour]
+                    points = [
+                        [float(point[0][0]), float(point[0][1])]
+                        for point in largest_contour
+                    ]
                 else:
                     # 輪郭が見つからない場合は元のpointsを使用
                     points = [[p.x(), p.y()] for p in s.points]
             else:
                 # 通常のpointsを使用
                 points = [[p.x(), p.y()] for p in s.points]
-            
+
             shape_data = dict(
                 label=s.label.encode("utf-8") if PY2 else s.label,
                 points=points,
@@ -934,21 +1011,25 @@ class MainWindow(QMainWindow):
             )
             custom_attrs = {}
 
-            particle_id = getattr(s, 'particle_id', None)
+            particle_id = getattr(s, "particle_id", None)
             if particle_id is not None:
                 custom_attrs["particle_id"] = int(particle_id)
 
-            secondary_group_id = getattr(s, 'secondary_group_id', None)
+            secondary_group_id = getattr(s, "secondary_group_id", None)
             if secondary_group_id is not None:
                 custom_attrs["secondary_group_id"] = int(secondary_group_id)
 
-            primary_segment_ids = getattr(s, 'primary_segment_ids', None)
+            primary_segment_ids = getattr(s, "primary_segment_ids", None)
             if primary_segment_ids:
-                custom_attrs["primary_segment_ids"] = [str(x) for x in primary_segment_ids if x is not None]
+                custom_attrs["primary_segment_ids"] = [
+                    str(x) for x in primary_segment_ids if x is not None
+                ]
 
-            primary_particle_ids = getattr(s, 'primary_particle_ids', None)
+            primary_particle_ids = getattr(s, "primary_particle_ids", None)
             if primary_particle_ids:
-                custom_attrs["primary_particle_ids"] = [int(x) for x in primary_particle_ids if x is not None]
+                custom_attrs["primary_particle_ids"] = [
+                    int(x) for x in primary_particle_ids if x is not None
+                ]
 
             if custom_attrs:
                 shape_data["custom_attrs"] = custom_attrs
@@ -967,7 +1048,7 @@ class MainWindow(QMainWindow):
             "imageWidth": self.raw_w,
         }
 
-        with open(filename, 'w') as f:
+        with open(filename, "w") as f:
             json.dump(save_data, f)
         return True
 
@@ -980,13 +1061,9 @@ class MainWindow(QMainWindow):
         caption = self.tr("Choose File")
         filters = self.tr("Label files")
         if self.output_dir:
-            dlg = QtWidgets.QFileDialog(
-                self, caption, self.output_dir, filters
-            )
+            dlg = QtWidgets.QFileDialog(self, caption, self.output_dir, filters)
         else:
-            dlg = QtWidgets.QFileDialog(
-                self, caption, self.currentPath(), filters
-            )
+            dlg = QtWidgets.QFileDialog(self, caption, self.currentPath(), filters)
         dlg.setDefaultSuffix(LabelFile.suffix[1:])
         dlg.setAcceptMode(QtWidgets.QFileDialog.AcceptSave)
         dlg.setOption(QtWidgets.QFileDialog.DontConfirmOverwrite, False)
@@ -1011,13 +1088,13 @@ class MainWindow(QMainWindow):
         return filename
 
     def currentPath(self):
-        #return osp.dirname(str(self.filename)) if self.filename else "."
+        # return osp.dirname(str(self.filename)) if self.filename else "."
         return "."
 
     def loadAnno(self, filename):
-        with open(filename,'r') as f:
+        with open(filename, "r") as f:
             data = json.load(f)
-        for shape_data in data['shapes']:
+        for shape_data in data["shapes"]:
             label = shape_data["label"]
             try:
                 ttt = int(label)
@@ -1033,10 +1110,7 @@ class MainWindow(QMainWindow):
                 # skip point-empty shape
                 continue
             shape = Shape(
-                label=label,
-                shape_type=shape_type,
-                group_id=group_id,
-                flags=flags
+                label=label, shape_type=shape_type, group_id=group_id, flags=flags
             )
             for x, y in points:
                 shape.addPoint(QtCore.QPointF(x, y))
@@ -1056,7 +1130,7 @@ class MainWindow(QMainWindow):
             # 既存(JSONから読込)shapeには印を付け、未グループ判定の対象外にする。
             # 判定は「このセッションで新規に描いたprimary」のみ対象とし、リンク情報を持たない
             # 古い保存データで誤警告しないようにする。
-            setattr(shape, 'loaded_from_json', True)
+            setattr(shape, "loaded_from_json", True)
 
             self.addLabel(shape)
         self.canvas.loadShapes([item.shape() for item in self.labelList])
@@ -1068,7 +1142,13 @@ class MainWindow(QMainWindow):
         # スケール未設定のうちは次へ進めない（先にスケールを設定させる）。
         # スケールは既存データならCSVから自動復元されるため、通常は初回の新規データのみここで止まる。
         if not self.scale_set:
-            QMessageBox.warning(self, self.tr("Warning"), self.tr("スケールが設定されていません。先にスケールを設定してください。"))
+            QMessageBox.warning(
+                self,
+                self.tr("Warning"),
+                self.tr(
+                    "スケールが設定されていません。先にスケールを設定してください。"
+                ),
+            )
             return
         # primary がグループ化(secondaryに内包)されているかを判定する。
         # 主シグナルは primary 自身の secondary_group_id（グループ化時に付与され、保存/復元される）。
@@ -1078,9 +1158,9 @@ class MainWindow(QMainWindow):
         for _it in self.labelList:
             _s = _it.shape()
             if _s.label == "secondary":
-                for _x in (getattr(_s, 'primary_segment_ids', None) or []):
+                for _x in getattr(_s, "primary_segment_ids", None) or []:
                     _contained.add(str(_x))
-                for _x in (getattr(_s, 'primary_particle_ids', None) or []):
+                for _x in getattr(_s, "primary_particle_ids", None) or []:
                     _contained.add(str(_x))
         _has_ungrouped = False
         for _it in self.labelList:
@@ -1089,12 +1169,12 @@ class MainWindow(QMainWindow):
                 continue
             # 既存(JSONから読み込んだ)primaryは検査対象外。古い保存データは
             # リンク情報を持たずグループ状態を判定できないため誤警告を避ける。
-            if getattr(_s, 'loaded_from_json', False):
+            if getattr(_s, "loaded_from_json", False):
                 continue
-            _grouped = getattr(_s, 'secondary_group_id', None) is not None
+            _grouped = getattr(_s, "secondary_group_id", None) is not None
             if not _grouped:
-                _gid = str(getattr(_s, 'group_id', ''))
-                _pid = getattr(_s, 'particle_id', None)
+                _gid = str(getattr(_s, "group_id", ""))
+                _pid = getattr(_s, "particle_id", None)
                 _pid = str(_pid) if _pid is not None else None
                 if _gid in _contained or (_pid is not None and _pid in _contained):
                     _grouped = True
@@ -1106,9 +1186,13 @@ class MainWindow(QMainWindow):
         # 既定は「いいえ(進まない)」なので、うっかりスキップは防げる。
         if _has_ungrouped:
             _ans = QMessageBox.question(
-                self, self.tr("確認"),
-                self.tr("グループ化していない primary があります。\nこのまま次の画像へ進みますか？（未グループの粒子は集計されません）"),
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                self,
+                self.tr("確認"),
+                self.tr(
+                    "グループ化していない primary があります。\nこのまま次の画像へ進みますか？（未グループの粒子は集計されません）"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
             )
             if _ans != QMessageBox.Yes:
                 return
@@ -1125,7 +1209,6 @@ class MainWindow(QMainWindow):
             self.current_img = self.img_list[self.current_img_index]
             self.loadImg()
 
-
     def choose_proposal1(self):
         if len(self.sam_mask_proposal) > 0:
             self.sam_mask = self.sam_mask_proposal[0]
@@ -1137,19 +1220,19 @@ class MainWindow(QMainWindow):
             self.sam_mask = self.sam_mask_proposal[1]
             self.canvas.setHiding()
             self.canvas.update()
-            
+
     def choose_proposal3(self):
         if len(self.sam_mask_proposal) > 2:
             self.sam_mask = self.sam_mask_proposal[2]
             self.canvas.setHiding()
             self.canvas.update()
-            
+
     def choose_proposal4(self):
         if len(self.sam_mask_proposal) > 3:
             self.sam_mask = self.sam_mask_proposal[3]
             self.canvas.setHiding()
-            self.canvas.update()    
-            
+            self.canvas.update()
+
     def loadImg(self):
         self.image = Image.open(self.current_img)
         self.image_np = np.array(self.image.convert("RGB"))
@@ -1157,7 +1240,7 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap(self.current_img)
         self.canvas.loadPixmap(pixmap)
         self.img_progress_bar.setValue(self.current_img_index)
-        
+
         # ファイル名ラベルを更新
         self.updateFilenameLabel()
 
@@ -1166,7 +1249,9 @@ class MainWindow(QMainWindow):
 
         img_name = os.path.basename(self.current_img)[:-4]
         # 共通の出力ディレクトリを使用してアノテーションファイルのパスを設定
-        self.current_output_filename = osp.join(self.current_output_dir, img_name + '.json')
+        self.current_output_filename = osp.join(
+            self.current_output_dir, img_name + ".json"
+        )
         self.labelList.clear()
         if os.path.isfile(self.current_output_filename):
             self.loadAnno(self.current_output_filename)
@@ -1183,26 +1268,28 @@ class MainWindow(QMainWindow):
 
     def adjustZoomToFitImage(self):
         """画像のサイズに表示を合わせるよう適切なズームレベルを設定する"""
-            
+
         # スクロールエリアの表示可能サイズを取得
         view_width = self.scrollArea.width() - 2  # スクロールバーの幅を考慮
         view_height = self.scrollArea.height() - 2
-        
+
         # 画像の実際のサイズを取得
         img_width = self.canvas.pixmap.width()
         img_height = self.canvas.pixmap.height()
-        
+
         # 縦横比を維持しながら、画面内に収まるズーム値を計算
         width_ratio = float(view_width) / img_width
         height_ratio = float(view_height) / img_height
-        
+
         # 小さい方の比率を使用して、画像全体が表示エリアに収まるようにする
-        zoom_factor = min(width_ratio, height_ratio) * 100  # zoomWidgetは100倍の値を使用
-        
+        zoom_factor = (
+            min(width_ratio, height_ratio) * 100
+        )  # zoomWidgetは100倍の値を使用
+
         # 計算したズーム値を適用
         self.zoomWidget.setValue(int(zoom_factor))
         self.setZoom(int(zoom_factor))
-        
+
         # 画像を中央に配置
         self.paintCanvas()
 
@@ -1210,10 +1297,12 @@ class MainWindow(QMainWindow):
         if self.image_directory is not None:
             directory = self.image_directory
         else:
-            directory = QFileDialog.getExistingDirectory(self, 'choose target fold', 'input')
-        if directory == '':
+            directory = QFileDialog.getExistingDirectory(
+                self, "choose target fold", "input"
+            )
+        if directory == "":
             return
-        
+
         # 入力フォルダ名を取得して保存し、出力ディレクトリを更新
         # 出力に入力の階層（ユーザー名/フォルダ名 等）を反映するため、
         # パス中の "input" ルート以降の相対パスを使う（例: input/aoi/X/フォルダ → aoi/X/フォルダ）。
@@ -1225,13 +1314,19 @@ class MainWindow(QMainWindow):
         # 設定ファイルが無い既存データは、既存CSVのファイル名からスケールを復元する
         self.recoverScaleFromExistingCSV()
 
-        #self.img_list = glob.glob(directory + '/*.{jpg,png,JPG,PNG}')
-        self.img_list = glob.glob(directory + '/*.jpg') + glob.glob(directory + '/*.png')
+        # self.img_list = glob.glob(directory + '/*.{jpg,png,JPG,PNG}')
+        self.img_list = glob.glob(directory + "/*.jpg") + glob.glob(
+            directory + "/*.png"
+        )
         # スケールバー画像はアノテーション対象外なので、常に画像リストから除外する
         # （スケール測定用の検出は findScaleBarImage がフォルダを直接見るため影響しない）
         self.img_list = [
-            p for p in self.img_list
-            if not any(k in os.path.basename(p).lower() for k in ('scalebar', 'scale', 'スケール'))
+            p
+            for p in self.img_list
+            if not any(
+                k in os.path.basename(p).lower()
+                for k in ("scalebar", "scale", "スケール")
+            )
         ]
         self.img_list.sort()
         self.img_len = len(self.img_list)
@@ -1240,8 +1335,8 @@ class MainWindow(QMainWindow):
         self.current_img_index = 0
         self.current_img = self.img_list[self.current_img_index]
         self.img_progress_bar.setMinimum(0)
-        self.img_progress_bar.setMaximum(self.img_len-1)
-        
+        self.img_progress_bar.setMaximum(self.img_len - 1)
+
         self.loadImg()
 
         # スケールが復元できなかった「真の新規データ」のみ、スケール測定を自動で促す。
@@ -1252,10 +1347,9 @@ class MainWindow(QMainWindow):
             if found:
                 self.startScaleBarMode()
 
-
     def clickSaveChoose(self):
-        directory = QFileDialog.getExistingDirectory(self, 'choose target fold','.')
-        if directory == '':
+        directory = QFileDialog.getExistingDirectory(self, "choose target fold", ".")
+        if directory == "":
             return
         else:
             self.base_output_dir = directory
@@ -1263,14 +1357,13 @@ class MainWindow(QMainWindow):
             self.loadImg()
             return directory
 
-
     def clickSwitchClass(self):
         if self.class_on_flag:
             self.class_on_flag = False
-            self.class_on_text.setText('Class Off')
+            self.class_on_text.setText("Class Off")
         else:
             self.class_on_flag = True
-            self.class_on_text.setText('Class On')
+            self.class_on_text.setText("Class On")
 
     # スケールバー測定関連の関数
     def startScaleBarMode(self):
@@ -1281,8 +1374,12 @@ class MainWindow(QMainWindow):
             self.findScaleBarImage()
             if self.scalebar_image is None:
                 # スケールバー画像が見つからなかった場合、メッセージボックスを表示
-                QMessageBox.warning(self, "警告", "スケールバー画像が見つかりませんでした。\n"
-                                  "画像フォルダに'scalebar'または'scale'を含む名前の画像を配置してください。")
+                QMessageBox.warning(
+                    self,
+                    "警告",
+                    "スケールバー画像が見つかりませんでした。\n"
+                    "画像フォルダに'scalebar'または'scale'を含む名前の画像を配置してください。",
+                )
                 return
 
         # スケールバー測定モードに入る
@@ -1297,22 +1394,34 @@ class MainWindow(QMainWindow):
     def findScaleBarImage(self):
         """フォルダ内からスケールバー画像を探して読み込む"""
         if not self.img_list:
-            QMessageBox.warning(self, "警告", "画像フォルダが選択されていません。\n"
-                              "まず画像フォルダを選択してください。")
+            QMessageBox.warning(
+                self,
+                "警告",
+                "画像フォルダが選択されていません。\n"
+                "まず画像フォルダを選択してください。",
+            )
             return
 
         # フォルダ内のすべての画像をチェック
         img_dir = os.path.dirname(self.img_list[0])
         scalebar_candidates = []
-        
-        for img_path in glob.glob(img_dir + '/*.jpg') + glob.glob(img_dir + '/*.png'):
+
+        for img_path in glob.glob(img_dir + "/*.jpg") + glob.glob(img_dir + "/*.png"):
             img_filename = os.path.basename(img_path).lower()
             # 「スケールバー」または「scalebar」、「scale」を含むファイル名を探す
-            if 'scalebar' in img_filename or 'scale' in img_filename or 'スケール' in img_filename:
+            if (
+                "scalebar" in img_filename
+                or "scale" in img_filename
+                or "スケール" in img_filename
+            ):
                 scalebar_candidates.append(img_path)
-        
+
         if len(scalebar_candidates) > 1:
-            QMessageBox.critical(self, "エラー", "フォルダ内にスケールバー画像が複数見つかりました。\n1つにしてください。")
+            QMessageBox.critical(
+                self,
+                "エラー",
+                "フォルダ内にスケールバー画像が複数見つかりました。\n1つにしてください。",
+            )
             self.scalebar_image = None
             return False
         elif len(scalebar_candidates) == 1:
@@ -1338,42 +1447,46 @@ class MainWindow(QMainWindow):
         if len(self.scale_points) != 2:
             QMessageBox.warning(self, "警告", "スケールバーの2点が指定されていません。")
             return
-        
+
         # 単位選択用のコンボボックス付きのダイアログを作成
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(self.tr("スケール設定"))
         layout = QtWidgets.QVBoxLayout(dialog)
-        
+
         # 値入力用のウィジェット
         form_layout = QtWidgets.QFormLayout()
         scale_value_edit = QtWidgets.QLineEdit()
-        scale_value_edit.setValidator(QtGui.QDoubleValidator(0, 1000000, 5))  # 正の浮動小数点数のみ
-        
+        scale_value_edit.setValidator(
+            QtGui.QDoubleValidator(0, 1000000, 5)
+        )  # 正の浮動小数点数のみ
+
         # 単位選択用のコンボボックス
         unit_combo = QtWidgets.QComboBox()
         unit_combo.addItems(["mm", "μm", "nm", "cm", "m"])
-        unit_combo.setCurrentText("μm") # 初期値を "μm" に設定
-        
+        unit_combo.setCurrentText("μm")  # 初期値を "μm" に設定
+
         form_layout.addRow("測定値:", scale_value_edit)
         form_layout.addRow("単位:", unit_combo)
         layout.addLayout(form_layout)
-        
+
         # ボタン
-        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
         layout.addWidget(button_box)
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
-        
+
         # ダイアログを表示
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             try:
                 scale_value = float(scale_value_edit.text())
                 scale_unit = unit_combo.currentText()
-                
+
                 # 2点間の距離（ピクセル）を計算
                 p1, p2 = self.scale_points
-                pixel_distance = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
-                
+                pixel_distance = math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
+
                 # スケール係数を計算（実際の長さ/ピクセル数）
                 self.scale_factor = scale_value / pixel_distance
                 self.scale_value = scale_value
@@ -1388,11 +1501,16 @@ class MainWindow(QMainWindow):
                     "cm": 10000.0,
                     "m": 1000000.0,
                 }
-                self.scale_um_per_px = self.scale_factor * unit_to_um.get(scale_unit, 1.0)
+                self.scale_um_per_px = self.scale_factor * unit_to_um.get(
+                    scale_unit, 1.0
+                )
 
                 # 既存実装は image_scaler_edit を参照して [um] 換算しているため、
                 # スケール確定時に自動で μm/px を反映しておく（手入力不要にする）
-                if hasattr(self, "image_scaler_edit") and self.image_scaler_edit is not None:
+                if (
+                    hasattr(self, "image_scaler_edit")
+                    and self.image_scaler_edit is not None
+                ):
                     self.image_scaler_edit.setText(f"{self.scale_um_per_px:.12f}")
 
                 # スケール確定時に永続化（再開時に測り直し不要にする）
@@ -1402,46 +1520,46 @@ class MainWindow(QMainWindow):
                 self.scale_status_label.setText(
                     f"スケール: {self.scale_um_per_px:.6f} μm/px"
                 )
-                
+
                 # スケールモードを終了
                 self.scale_mode = False
                 self.canvas.set_scale_mode(False)
-                
+
                 # 強制的に描画を更新し、マスクが表示されるようにする
                 self.canvas.update()
                 QtWidgets.QApplication.processEvents()  # イベントループを処理
-                
+
                 # 最初の画像に戻る（存在する場合）
                 if self.img_len > 0:
                     self.current_img_index = 0
                     self.current_img = self.img_list[self.current_img_index]
                     self.loadImg()
-                
+
             except ValueError:
                 QMessageBox.warning(self, "エラー", "有効な数値を入力してください。")
                 # Reset scale points and related canvas state
                 self.scale_points = []
-                if hasattr(self.canvas, 'scale_points'):
-                    self.canvas.scale_points = [] # Clear points in canvas as well
-                self.canvas.update() # Force repaint to clear the drawn points/line
-        else: # Dialog was cancelled or closed
+                if hasattr(self.canvas, "scale_points"):
+                    self.canvas.scale_points = []  # Clear points in canvas as well
+                self.canvas.update()  # Force repaint to clear the drawn points/line
+        else:  # Dialog was cancelled or closed
             # Reset scale points and related canvas state
             self.scale_points = []
-            if hasattr(self.canvas, 'scale_points'):
+            if hasattr(self.canvas, "scale_points"):
                 self.canvas.scale_points = []
-            self.canvas.update() # Force repaint to clear the drawn points/line
+            self.canvas.update()  # Force repaint to clear the drawn points/line
 
     def showExperimentParamsDialog(self):
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(self.tr("Experiment Parameters"))
         form_layout = QtWidgets.QFormLayout(dialog)
-        
+
         # ダイアログ用のローカルな入力欄を作成し，既存の隠し QLineEdit の内容で初期化
         date_edit = QtWidgets.QDateEdit()
         date_edit.setDisplayFormat("yyyy/MM/dd")
         date_edit.setCalendarPopup(True)  # カレンダーポップアップを有効化
         date_edit.setDate(QtCore.QDate.currentDate())  # 現在の日付を初期値として設定
-        
+
         # 既存の日付が設定されている場合は、それを表示
         if self.date_edit.text():
             try:
@@ -1451,20 +1569,26 @@ class MainWindow(QMainWindow):
                     date_edit.setDate(existing_date)
             except Exception:
                 pass
-        
+
         experimenter_edit = QtWidgets.QLineEdit(self.experimenter_edit.text())
         impurity_type_edit = QtWidgets.QLineEdit(self.impurity_type_edit.text())
         impurity_conc_edit = QtWidgets.QLineEdit(self.impurity_conc_edit.text())
         seed_size_edit = QtWidgets.QLineEdit(self.seed_size_edit.text())
         crystal_time_edit = QtWidgets.QLineEdit(self.crystal_time_edit.text())
-        suspension_density_edit = QtWidgets.QLineEdit(self.suspension_density_edit.text())
+        suspension_density_edit = QtWidgets.QLineEdit(
+            self.suspension_density_edit.text()
+        )
         image_scaler_edit = QtWidgets.QLineEdit(self.image_scaler_edit.text())
-        
+
         # スケール情報表示フィールドを追加
-        scale_info = f"{self.scale_factor:.6f} {self.scale_unit}/px" if self.scale_set else "未設定"
+        scale_info = (
+            f"{self.scale_factor:.6f} {self.scale_unit}/px"
+            if self.scale_set
+            else "未設定"
+        )
         scale_info_label = QtWidgets.QLabel(scale_info)
         scale_info_label.setStyleSheet("font-weight: bold;")
-        
+
         form_layout.addRow(self.tr("日付:"), date_edit)
         form_layout.addRow(self.tr("実験者:"), experimenter_edit)
         form_layout.addRow(self.tr("夾雑イオン種類:"), impurity_type_edit)
@@ -1474,13 +1598,15 @@ class MainWindow(QMainWindow):
         form_layout.addRow(self.tr("懸濁密度:"), suspension_density_edit)
         # form_layout.addRow(self.tr("画像のスケーラー:"), image_scaler_edit)
         # form_layout.addRow(self.tr("スケール設定:"), scale_info_label)
-        
+
         # OK/Cancel ボタン
-        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
         form_layout.addRow(button_box)
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
-        
+
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             # 日付を指定された形式（yyMMdd）で保存
             formatted_date = date_edit.date().toString("yyMMdd")
@@ -1518,7 +1644,8 @@ class MainWindow(QMainWindow):
         mutually exclusive entries that trigger clickLoadSAM(model_name) on
         selection (this both performs the initial load and runtime
         switches). micro-sam entries are available only when the isolated
-        interpreter exists under ``envs/micro_sam``.
+        interpreter exists under ``envs/micro_sam``. MatSAM entries require
+        both their isolated interpreter and their model-specific checkpoint.
         """
         self.samModelMenu = QtWidgets.QMenu(self.tr("SAM Model"), self)
         self.samModelActionGroup = QtWidgets.QActionGroup(self)
@@ -1543,15 +1670,45 @@ class MainWindow(QMainWindow):
             micro_act.setChecked(name == self.sam_model)
             micro_act.setEnabled(micro_sam_available)
             if micro_sam_available:
-                micro_act.triggered.connect(
-                    functools.partial(self.clickLoadSAM, name)
-                )
+                micro_act.triggered.connect(functools.partial(self.clickLoadSAM, name))
             else:
                 micro_act.setToolTip(micro_sam_tip)
                 micro_act.setStatusTip(micro_sam_tip)
             self.samModelActionGroup.addAction(micro_act)
             microSamMenu.addAction(micro_act)
             self.samModelActions[name] = micro_act
+
+        matSamMenu = self.samModelMenu.addMenu(self.tr("MatSAM"))
+        matsam_env_available = matsam_interpreter_exists()
+        for name in MATSAM_MODEL_NAMES:
+            model_spec = MATSAM_MODEL_SPECS[name]
+            checkpoint_path = model_spec.checkpoint_path
+            if not os.path.isabs(checkpoint_path):
+                checkpoint_path = os.path.join(project_root, checkpoint_path)
+            checkpoint_available = os.path.isfile(checkpoint_path)
+            matsam_available = matsam_env_available and checkpoint_available
+            label = name if matsam_available else f"{name} (未導入/Phase 4)"
+            matsam_act = QtWidgets.QAction(self.tr(label), self, checkable=True)
+            matsam_act.setChecked(name == self.sam_model)
+            matsam_act.setEnabled(matsam_available)
+            if matsam_available:
+                matsam_act.triggered.connect(functools.partial(self.clickLoadSAM, name))
+            else:
+                if not matsam_env_available:
+                    matsam_tip = self.tr(
+                        "未導入(別環境/Phase 4): MatSAM は別環境への"
+                        "インストールが必要です"
+                    )
+                else:
+                    matsam_tip = self.tr(
+                        f"未導入(Phase 4): チェックポイントが見つかりません: "
+                        f"{checkpoint_path}"
+                    )
+                matsam_act.setToolTip(matsam_tip)
+                matsam_act.setStatusTip(matsam_tip)
+            self.samModelActionGroup.addAction(matsam_act)
+            matSamMenu.addAction(matsam_act)
+            self.samModelActions[name] = matsam_act
 
         self.samModelMenuAction = self.samModelMenu.menuAction()
         self.samModelMenuAction.setText(self.tr("SAM Model"))
@@ -1569,7 +1726,9 @@ class MainWindow(QMainWindow):
         if self._samLoadInFlight:
             return
         target_model = model_name or getattr(self, "sam_model", "large")
-        all_model_names = set(SAM2_MODEL_SPECS) | set(MICRO_SAM_MODEL_NAMES)
+        all_model_names = (
+            set(SAM2_MODEL_SPECS) | set(MICRO_SAM_MODEL_NAMES) | set(MATSAM_MODEL_NAMES)
+        )
         if target_model not in all_model_names:
             self.actions.autoSeg.setEnabled(False)
             QMessageBox.warning(self, "警告", f"不明なSAMモデルです: {target_model}")
@@ -1579,7 +1738,9 @@ class MainWindow(QMainWindow):
 
         old_segmenter = self.segmenter
         is_micro_sam_target = target_model in MICRO_SAM_MODEL_SPECS
+        is_matsam_target = target_model in MATSAM_MODEL_SPECS
         micro_sam_client: MicroSamWorkerClient | None = None
+        matsam_client: MatSamWorkerClient | None = None
         if is_micro_sam_target:
             print(f"micro-samモデルを読み込みます: {target_model}")
             new_segmenter: SegmenterAdapter = MicroSamAdapter(target_model)
@@ -1604,9 +1765,45 @@ class MainWindow(QMainWindow):
                 )
                 self._restoreSamLoadUi()
                 return
+        elif is_matsam_target:
+            print(f"MatSAMモデルを読み込みます: {target_model}")
+            new_segmenter = MatSamAdapter(target_model)
+            old_segmenter_to_unload = None
+            try:
+                if not matsam_interpreter_exists():
+                    raise NotInstalledError(
+                        "MatSAM がインストールされていません。"
+                        "分離環境 envs/matsam が必要です。"
+                        "SAM2またはmicro-samモデルを選択してください。"
+                    )
+                checkpoint_path = MATSAM_MODEL_SPECS[target_model].checkpoint_path
+                if not os.path.isabs(checkpoint_path):
+                    checkpoint_path = os.path.join(project_root, checkpoint_path)
+                if not os.path.isfile(checkpoint_path):
+                    raise NotInstalledError(
+                        f"MatSAMチェックポイントが見つかりません: {checkpoint_path}。"
+                        "チェックポイントを配置するか、別のSAMモデルを選択してください。"
+                    )
+                # Construct Popen on the long-lived GUI thread. Only blocking
+                # probe/hash/init work is delegated to _SamLoadWorker.
+                matsam_client = MatSamWorkerClient()
+            except (NotInstalledError, NotImplementedError) as e:
+                QMessageBox.warning(self, "警告", str(e))
+                self._restoreSamLoadUi()
+                return
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "エラー",
+                    f"SAMモデルの読み込みに失敗しました: {e}",
+                )
+                self._restoreSamLoadUi()
+                return
         else:
-            print(f"SAM2モデルを読み込みます: {target_model} "
-                  f"({SAM2_MODEL_SPECS[target_model].checkpoint_path})")
+            print(
+                f"SAM2モデルを読み込みます: {target_model} "
+                f"({SAM2_MODEL_SPECS[target_model].checkpoint_path})"
+            )
             new_segmenter = Sam2Adapter(SAM2_MODEL_SPECS[target_model])
             old_segmenter_to_unload = old_segmenter
             # SAM2 must release the old model before loading the new one to
@@ -1626,6 +1823,7 @@ class MainWindow(QMainWindow):
             new_segmenter,
             old_segmenter_to_unload,
             micro_sam_client,
+            matsam_client,
         )
         worker.moveToThread(thread)
         self._samLoadThread = thread
@@ -1635,10 +1833,16 @@ class MainWindow(QMainWindow):
         self._samLoadLoop = loop
         progress_dialog = QtWidgets.QProgressDialog(self)
         progress_dialog.setWindowTitle("SAMモデル読込")
-        progress_dialog.setLabelText(
-            "SAMモデルを準備中… 初回はチェックポイントのダウンロードのため"
-            "数分かかることがあります"
-        )
+        if is_matsam_target:
+            progress_dialog.setLabelText(
+                "MatSAMモデルを準備中… 大きなチェックポイントの読み込みに"
+                "時間がかかることがあります"
+            )
+        else:
+            progress_dialog.setLabelText(
+                "SAMモデルを準備中… 初回はチェックポイントのダウンロードのため"
+                "数分かかることがあります"
+            )
         progress_dialog.setCancelButtonText("キャンセル")
         progress_dialog.setRange(0, 0)
         progress_dialog.setWindowModality(Qt.WindowModal)
@@ -1696,7 +1900,9 @@ class MainWindow(QMainWindow):
             # Anything else (Hydra config errors, CUDA OOM, missing
             # checkpoint file, ...) still must not crash the GUI or leave
             # the toolbar stuck disabled.
-            QMessageBox.critical(self, "エラー", f"SAMモデルの読み込みに失敗しました: {e}")
+            QMessageBox.critical(
+                self, "エラー", f"SAMモデルの読み込みに失敗しました: {e}"
+            )
             self._restoreSamLoadUi()
             return
 
@@ -1704,13 +1910,15 @@ class MainWindow(QMainWindow):
         if loaded_segmenter is None:
             self._restoreSamLoadUi()
             return
-        if is_micro_sam_target and old_segmenter is not None:
+        if (is_micro_sam_target or is_matsam_target) and old_segmenter is not None:
             old_segmenter.unload()
         self.segmenter = loaded_segmenter
         self.sam_model = target_model
         self._syncSamModelMenuChecked()
         self.actions.autoSeg.setEnabled(True)
-        self.actions.promptSeg.setEnabled(True)
+        self.actions.promptSeg.setEnabled(
+            not isinstance(loaded_segmenter, MatSamAdapter)
+        )
         self._setSamModelMenuEnabled(True)
 
     @QtCore.Slot(object, object)
@@ -1797,7 +2005,9 @@ class MainWindow(QMainWindow):
         self._syncSamModelMenuChecked()
         enabled = self.segmenter is not None
         self.actions.autoSeg.setEnabled(enabled)
-        self.actions.promptSeg.setEnabled(enabled)
+        self.actions.promptSeg.setEnabled(
+            enabled and not isinstance(self.segmenter, MatSamAdapter)
+        )
         self._setSamModelMenuEnabled(True)
 
     def _setSamModelMenuEnabled(self, enabled: bool) -> None:
@@ -1827,6 +2037,23 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.critical(self, "エラー", f"micro-sam 推論に失敗しました: {error}")
 
+    def _handleMatSamClientError(self, error: MatSamClientError) -> None:
+        """Reset GUI backend state after a MatSAM client failure."""
+        if error.fatal:
+            old_segmenter = self.segmenter
+            self.segmenter = None
+            if old_segmenter is not None:
+                old_segmenter.unload()
+            self.actions.autoSeg.setEnabled(False)
+            self.actions.promptSeg.setEnabled(False)
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"MatSAM ワーカーが停止しました。モデルを再読込してください: {error}",
+            )
+            return
+        QMessageBox.critical(self, "エラー", f"MatSAM 推論に失敗しました: {error}")
+
     def clickAutoSeg(self) -> None:
         """Generate editable primary polygons with SAM2 AMG."""
         if self.segmenter is None:
@@ -1846,6 +2073,9 @@ class MainWindow(QMainWindow):
         except MicroSamClientError as exc:
             self._handleMicroSamClientError(exc)
             return
+        except MatSamClientError as exc:
+            self._handleMatSamClientError(exc)
+            return
         except Exception as exc:
             QMessageBox.critical(
                 self,
@@ -1863,8 +2093,12 @@ class MainWindow(QMainWindow):
                 "条件に合うマスクは見つかりませんでした。",
             )
 
-    def _showAutoSegParamsDialog(self) -> AmgParams | MicroSamParams | None:
+    def _showAutoSegParamsDialog(
+        self,
+    ) -> AmgParams | MicroSamParams | MatSamParams | None:
         """Dispatch to the active backend's automatic parameter dialog."""
+        if isinstance(self.segmenter, MatSamAdapter):
+            return self._showMatSamAutoSegParamsDialog()
         if isinstance(self.segmenter, MicroSamAdapter):
             return self._showMicroSamAutoSegParamsDialog(self.segmenter)
         return self._showSam2AutoSegParamsDialog()
@@ -2072,6 +2306,95 @@ class MainWindow(QMainWindow):
             nms_threshold=nms_threshold.value(),
         )
 
+    def _showMatSamAutoSegParamsDialog(self) -> MatSamParams | None:
+        """Show MatSAM automatic segmentation parameter controls."""
+        defaults = MatSamParams()
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("MatSAM 自動セグメンテーション設定")
+        form_layout = QtWidgets.QFormLayout(dialog)
+
+        layers = QtWidgets.QSpinBox(dialog)
+        layers.setRange(0, AUTO_SEG_MAX_LAYERS)
+        layers.setValue(defaults.layers)
+        form_layout.addRow("クロップレイヤー数", layers)
+
+        scales = QtWidgets.QSpinBox(dialog)
+        scales.setRange(1, AUTO_SEG_MAX_SCALES)
+        scales.setValue(defaults.scales)
+        form_layout.addRow("点数ダウンスケール係数", scales)
+
+        n_per_side_base = QtWidgets.QSpinBox(dialog)
+        n_per_side_base.setRange(
+            AUTO_SEG_MIN_POINTS_PER_SIDE,
+            AUTO_SEG_MAX_POINTS_PER_SIDE,
+        )
+        n_per_side_base.setValue(defaults.n_per_side_base)
+        form_layout.addRow("基本の一辺あたりの点数", n_per_side_base)
+
+        method_type = QtWidgets.QSpinBox(dialog)
+        method_type.setRange(MATSAM_METHOD_TYPE_MIN, MATSAM_METHOD_TYPE_MAX)
+        method_type.setValue(defaults.method_type)
+        method_type.setToolTip("1: Canny、2: OTSU")
+        form_layout.addRow("プロンプト生成方式", method_type)
+
+        pred_iou_thresh = self._createAutoSegThresholdSpinBox(
+            dialog,
+            defaults.pred_iou_thresh,
+        )
+        form_layout.addRow("IoU予測しきい値", pred_iou_thresh)
+
+        stability_score_thresh = self._createAutoSegThresholdSpinBox(
+            dialog,
+            defaults.stability_score_thresh,
+        )
+        form_layout.addRow("安定性スコアしきい値", stability_score_thresh)
+
+        box_nms_thresh = self._createAutoSegThresholdSpinBox(
+            dialog,
+            defaults.box_nms_thresh,
+        )
+        form_layout.addRow("Box NMSしきい値", box_nms_thresh)
+
+        min_mask_region_area = QtWidgets.QSpinBox(dialog)
+        min_mask_region_area.setRange(
+            AUTO_SEG_MIN_REGION_AREA,
+            AUTO_SEG_MAX_REGION_AREA,
+        )
+        min_mask_region_area.setValue(defaults.min_mask_region_area)
+        form_layout.addRow("最小マスク面積", min_mask_region_area)
+
+        max_image_size = QtWidgets.QSpinBox(dialog)
+        max_image_size.setRange(1, AUTO_SEG_MAX_IMAGE_SIZE)
+        max_image_size.setValue(defaults.max_image_size)
+        form_layout.addRow("内部処理の最大画像辺", max_image_size)
+
+        buttons = QtWidgets.QDialogButtonBox(dialog)
+        run_button = buttons.addButton(
+            "自動実行",
+            QtWidgets.QDialogButtonBox.AcceptRole,
+        )
+        cancel_button = buttons.addButton(
+            "キャンセル",
+            QtWidgets.QDialogButtonBox.RejectRole,
+        )
+        run_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        form_layout.addRow(buttons)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+        return MatSamParams(
+            layers=layers.value(),
+            scales=scales.value(),
+            n_per_side_base=n_per_side_base.value(),
+            method_type=method_type.value(),
+            pred_iou_thresh=pred_iou_thresh.value(),
+            stability_score_thresh=stability_score_thresh.value(),
+            box_nms_thresh=box_nms_thresh.value(),
+            min_mask_region_area=min_mask_region_area.value(),
+            max_image_size=max_image_size.value(),
+        )
+
     def _createAutoSegThresholdSpinBox(
         self,
         parent: QtWidgets.QWidget,
@@ -2100,7 +2423,7 @@ class MainWindow(QMainWindow):
 
     def _runAutoSegOnCurrentImage(
         self,
-        params: AmgParams | MicroSamParams,
+        params: AmgParams | MicroSamParams | MatSamParams,
     ) -> list[Shape]:
         """Generate, register, and display primary polygons for the open image."""
         if self.segmenter is None:
@@ -2162,21 +2485,21 @@ class MainWindow(QMainWindow):
         self.canvas.loadShapes(new_shapes, replace=False)
         self.setDirty()
         return new_shapes
-    
+
     def getMaxId(self):
         max_id = -1
         for label in self.labelList:
             if label.shape().group_id is not None:
                 max_id = max(max_id, int(label.shape().group_id))
         return max_id
-        
+
     def show_proposals(self, masks=None, flag=1):
         if flag != 1:
             img = cv2.imread(self.current_img)
             if len(img.shape) == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
+
             # Get button dimensions once, assuming all proposal buttons are the same size
             # If they can be different, this should be inside the loop
             if not self.button_proposal_list:
@@ -2184,12 +2507,14 @@ class MainWindow(QMainWindow):
             button_width = self.button_proposal_list[0].width()
             button_height = self.button_proposal_list[0].height()
 
-            for msk_idx in range(masks.shape[0]): # Iterate through each mask proposal
-                if msk_idx >= len(self.button_proposal_list): # Don't exceed available buttons
+            for msk_idx in range(masks.shape[0]):  # Iterate through each mask proposal
+                if msk_idx >= len(
+                    self.button_proposal_list
+                ):  # Don't exceed available buttons
                     break
 
                 current_button = self.button_proposal_list[msk_idx]
-                tmp_mask_slice = masks[msk_idx] # This is a single mask (H, W)
+                tmp_mask_slice = masks[msk_idx]  # This is a single mask (H, W)
                 tmp_vis_for_button = img.copy()
 
                 # Apply mask overlay to tmp_vis_for_button
@@ -2200,11 +2525,11 @@ class MainWindow(QMainWindow):
                 # and mask is 2D. We stack the boolean mask to 3 channels.
                 if tmp_vis_for_button.ndim == 3 and bool_mask_slice.ndim == 2:
                     if tmp_vis_for_button.shape[:2] == bool_mask_slice.shape:
-                        bool_mask_expanded = np.stack([bool_mask_slice]*3, axis=-1)
+                        bool_mask_expanded = np.stack([bool_mask_slice] * 3, axis=-1)
                         tmp_vis_for_button = np.where(
                             bool_mask_expanded,
-                            0.5 * tmp_vis_for_button + 0.5 * np.array([30,30,220]),
-                            tmp_vis_for_button
+                            0.5 * tmp_vis_for_button + 0.5 * np.array([30, 30, 220]),
+                            tmp_vis_for_button,
                         ).astype(np.uint8)
                     # else: print(f"Shape mismatch for overlay: img {tmp_vis_for_button.shape[:2]} mask {bool_mask_slice.shape}")
                 # else: print(f"Vis/Mask ndim issue: vis {tmp_vis_for_button.ndim}, mask {bool_mask_slice.ndim}")
@@ -2215,60 +2540,70 @@ class MainWindow(QMainWindow):
                     continue  # Skip if image is invalid
 
                 aspect_ratio = img_w / img_h
-                
+
                 target_w = button_width
                 target_h = int(target_w / aspect_ratio)
 
                 if target_h > button_height:
                     target_h = button_height
                     target_w = int(target_h * aspect_ratio)
-                
+
                 if target_w <= 0 or target_h <= 0:
                     continue  # Skip if dimensions are invalid
 
                 try:
-                    resized_vis = cv2.resize(tmp_vis_for_button, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                    resized_vis = cv2.resize(
+                        tmp_vis_for_button,
+                        (target_w, target_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
                 except cv2.error:
                     # print(f"cv2.resize error: {e} with target_w={target_w}, target_h={target_h}")
                     continue
 
-                q_image = QImage(resized_vis.data, resized_vis.shape[1], resized_vis.shape[0], resized_vis.strides[0], QImage.Format_RGB888)
+                q_image = QImage(
+                    resized_vis.data,
+                    resized_vis.shape[1],
+                    resized_vis.shape[0],
+                    resized_vis.strides[0],
+                    QImage.Format_RGB888,
+                )
                 pixmap = QPixmap.fromImage(q_image)
-                
+
                 current_button.setIcon(QIcon(pixmap))
                 current_button.setIconSize(QSize(target_w, target_h))
-                current_button.setText('') 
-                current_button.setShortcut(str(msk_idx+1))
+                current_button.setText("")
+                current_button.setShortcut(str(msk_idx + 1))
 
-        else: # flag == 1 (clear proposals)
+        else:  # flag == 1 (clear proposals)
             for idx, button_proposal in enumerate(self.button_proposal_list):
-                button_proposal.setIcon(QIcon()) # Clear icon
-                button_proposal.setText('proposal{}'.format(idx+1))
-                button_proposal.setIconSize(QSize(0,0))
-                button_proposal.setShortcut(str(idx+1))
+                button_proposal.setIcon(QIcon())  # Clear icon
+                button_proposal.setText("proposal{}".format(idx + 1))
+                button_proposal.setIconSize(QSize(0, 0))
+                button_proposal.setShortcut(str(idx + 1))
 
     def transform_input(self, image, box=None, points=None):
         if self.keep_input_size:
             return image, box, points
         else:
-            h,w = image.shape[:2]
-            scale_ratio = self.max_size / max(h,w)
-            image = cv2.resize(image, (int(w*scale_ratio), int(h*scale_ratio)))
+            h, w = image.shape[:2]
+            scale_ratio = self.max_size / max(h, w)
+            image = cv2.resize(image, (int(w * scale_ratio), int(h * scale_ratio)))
             if box is not None:
                 box = box * scale_ratio
             if points is not None:
                 points = points * scale_ratio
             return image, box, points
-    
+
     def transform_output(self, masks, size):
         if self.keep_input_size:
             return masks
         else:
-            h,w = size
+            h, w = size
             N = masks.shape[0]
-            new_masks = np.zeros((N,h,w), dtype=np.uint8)
+            new_masks = np.zeros((N, h, w), dtype=np.uint8)
             for idx in range(N):
-                new_masks[idx] = cv2.resize(masks[idx], (w,h))
+                new_masks[idx] = cv2.resize(masks[idx], (w, h))
             return new_masks
 
     def _runPromptPrediction(
@@ -2283,6 +2618,14 @@ class MainWindow(QMainWindow):
         """Run one prompt RPC and recover the GUI from fatal worker errors."""
         if self.segmenter is None:
             return None
+        if isinstance(self.segmenter, MatSamAdapter):
+            QMessageBox.warning(
+                self,
+                "警告",
+                "MatSAMは自動分割専用です。ポイントまたはボックスプロンプトを"
+                "使用するにはSAM2またはmicro-samモデルを選択してください。",
+            )
+            return None
         try:
             self.segmenter.set_image(image_np, image_key)
             return self.segmenter.predict(
@@ -2294,17 +2637,22 @@ class MainWindow(QMainWindow):
         except MicroSamClientError as exc:
             self._handleMicroSamClientError(exc)
             return None
+        except MatSamClientError as exc:
+            self._handleMatSamClientError(exc)
+            return None
 
     def clickManualSegBBox(self):
         Box = self.canvas.currentBox
-        if self.segmenter is None or self.current_img == '' or Box is None:
+        if self.segmenter is None or self.current_img == "" or Box is None:
             return
         # Use .copy() to ensure the array is contiguous with positive strides
-        img = cv2.imread(self.current_img)[:,:,::-1].copy()
+        img = cv2.imread(self.current_img)[:, :, ::-1].copy()
         rh, rw = img.shape[:2]
         input_box = np.array([Box[0].x(), Box[0].y(), Box[1].x(), Box[1].y()])
         img, input_box, _ = self.transform_input(img, box=input_box)
-        image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
+        image_key = build_image_key(
+            self.current_img, self.keep_input_size, self.max_size
+        )
         prediction = self._runPromptPrediction(
             img,
             image_key,
@@ -2318,35 +2666,44 @@ class MainWindow(QMainWindow):
         # self.masks = masks_sam_raw # Store raw SAM masks if needed for other purposes
 
         # Transform raw masks to original image dimensions
-        masks_sam_transformed = self.transform_output(masks_sam_raw.astype(np.uint8), (rh,rw))
+        masks_sam_transformed = self.transform_output(
+            masks_sam_raw.astype(np.uint8), (rh, rw)
+        )
 
         # Filter and reconstruct masks for display and shape creation
         # self.area_threshold is updated by the QSpinBox
         filtered_masks_for_show_and_shape = self.filter_and_reconstruct_masks(
-            masks_sam_transformed, 
-            self.area_threshold
+            masks_sam_transformed, self.area_threshold
         )
 
         # Show proposals using filtered masks
-        self.show_proposals(filtered_masks_for_show_and_shape, 0) 
-        
+        self.show_proposals(filtered_masks_for_show_and_shape, 0)
+
         self.sam_mask_proposal = []
         # Determine target_idx based on iou_prediction from unfiltered masks
         # This ensures the "best" proposal is still based on SAM's original confidence
-        target_idx = np.argmax(iou_prediction) 
+        target_idx = np.argmax(iou_prediction)
 
         for msk_idx in range(filtered_masks_for_show_and_shape.shape[0]):
             # Use the filtered mask to find contours for Shape objects
-            mask_for_shape_creation = filtered_masks_for_show_and_shape[msk_idx].astype(np.uint8)
-            
-            # Ensure mask_for_shape_creation is C-contiguous
-            mask_for_shape_creation_contiguous = np.ascontiguousarray(mask_for_shape_creation)
-            
-            points_list = cv2.findContours(mask_for_shape_creation_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
-            shape_type = 'polygon'
-            tmp_sam_mask_shapes = [] # Stores Shape objects for the current proposal
+            mask_for_shape_creation = filtered_masks_for_show_and_shape[msk_idx].astype(
+                np.uint8
+            )
 
-            if not points_list: # If filtering removed all contours
+            # Ensure mask_for_shape_creation is C-contiguous
+            mask_for_shape_creation_contiguous = np.ascontiguousarray(
+                mask_for_shape_creation
+            )
+
+            points_list = cv2.findContours(
+                mask_for_shape_creation_contiguous,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )[0]
+            shape_type = "polygon"
+            tmp_sam_mask_shapes = []  # Stores Shape objects for the current proposal
+
+            if not points_list:  # If filtering removed all contours
                 if msk_idx == target_idx:
                     self.sam_mask = []
                 self.sam_mask_proposal.append([])
@@ -2359,33 +2716,39 @@ class MainWindow(QMainWindow):
                 # if area == 0: # Or some very small threshold if `filter_and_reconstruct_masks` might leave tiny artifacts
                 #     continue
 
-                pointsx = points[:,0,0]
-                pointsy = points[:,0,1]
+                pointsx = points[:, 0, 0]
+                pointsy = points[:, 0, 1]
 
                 shape = Shape(
-                    label='Object', # Default label
+                    label="Object",  # Default label
                     shape_type=shape_type,
                     group_id=self.getMaxId() + 1,
                 )
                 for point_index in range(pointsx.shape[0]):
-                    shape.addPoint(QtCore.QPointF(pointsx[point_index], pointsy[point_index]))
+                    shape.addPoint(
+                        QtCore.QPointF(pointsx[point_index], pointsy[point_index])
+                    )
                 shape.close()
-                
+
                 # SAMから出力された元のマスクデータを保存
-                setattr(shape, 'original_sam_mask', mask_for_shape_creation.copy())
-                
+                setattr(shape, "original_sam_mask", mask_for_shape_creation.copy())
+
                 tmp_sam_mask_shapes.append(shape)
-            
+
             if msk_idx == target_idx:
-                self.sam_mask = tmp_sam_mask_shapes 
+                self.sam_mask = tmp_sam_mask_shapes
             self.sam_mask_proposal.append(tmp_sam_mask_shapes)
 
     def clickManualSegBox(self):
         ClickPos = self.canvas.currentPos
         ClickNeg = self.canvas.currentNeg
-        if self.segmenter is None or self.current_img == '' or (ClickPos is None and ClickNeg is None):
+        if (
+            self.segmenter is None
+            or self.current_img == ""
+            or (ClickPos is None and ClickNeg is None)
+        ):
             return
-        img = cv2.imread(self.current_img)[:,:,::-1].copy()
+        img = cv2.imread(self.current_img)[:, :, ::-1].copy()
         rh, rw = img.shape[:2]
 
         input_clicks = []
@@ -2408,7 +2771,9 @@ class MainWindow(QMainWindow):
 
         img, _, input_clicks = self.transform_input(img, points=input_clicks)
 
-        image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
+        image_key = build_image_key(
+            self.current_img, self.keep_input_size, self.max_size
+        )
         prediction = self._runPromptPrediction(
             img,
             image_key,
@@ -2421,35 +2786,44 @@ class MainWindow(QMainWindow):
         # self.masks = masks_sam_raw # Store raw SAM masks if needed for other purposes
 
         # Transform raw masks to original image dimensions
-        masks_sam_transformed = self.transform_output(masks_sam_raw.astype(np.uint8), (rh,rw))
+        masks_sam_transformed = self.transform_output(
+            masks_sam_raw.astype(np.uint8), (rh, rw)
+        )
 
         # Filter and reconstruct masks for display and shape creation
         # self.area_threshold is updated by the QSpinBox
         filtered_masks_for_show_and_shape = self.filter_and_reconstruct_masks(
-            masks_sam_transformed, 
-            self.area_threshold
+            masks_sam_transformed, self.area_threshold
         )
 
         # Show proposals using filtered masks
-        self.show_proposals(filtered_masks_for_show_and_shape, 0) 
-        
+        self.show_proposals(filtered_masks_for_show_and_shape, 0)
+
         self.sam_mask_proposal = []
         # Determine target_idx based on iou_prediction from unfiltered masks
         # This ensures the "best" proposal is still based on SAM's original confidence
-        target_idx = np.argmax(iou_prediction) 
+        target_idx = np.argmax(iou_prediction)
 
         for msk_idx in range(filtered_masks_for_show_and_shape.shape[0]):
             # Use the filtered mask to find contours for Shape objects
-            mask_for_shape_creation = filtered_masks_for_show_and_shape[msk_idx].astype(np.uint8)
-            
-            # Ensure mask_for_shape_creation is C-contiguous
-            mask_for_shape_creation_contiguous = np.ascontiguousarray(mask_for_shape_creation)
-            
-            points_list = cv2.findContours(mask_for_shape_creation_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
-            shape_type = 'polygon'
-            tmp_sam_mask_shapes = [] # Stores Shape objects for the current proposal
+            mask_for_shape_creation = filtered_masks_for_show_and_shape[msk_idx].astype(
+                np.uint8
+            )
 
-            if not points_list: # If filtering removed all contours
+            # Ensure mask_for_shape_creation is C-contiguous
+            mask_for_shape_creation_contiguous = np.ascontiguousarray(
+                mask_for_shape_creation
+            )
+
+            points_list = cv2.findContours(
+                mask_for_shape_creation_contiguous,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )[0]
+            shape_type = "polygon"
+            tmp_sam_mask_shapes = []  # Stores Shape objects for the current proposal
+
+            if not points_list:  # If filtering removed all contours
                 if msk_idx == target_idx:
                     self.sam_mask = []
                 self.sam_mask_proposal.append([])
@@ -2462,30 +2836,32 @@ class MainWindow(QMainWindow):
                 # if area == 0: # Or some very small threshold if `filter_and_reconstruct_masks` might leave tiny artifacts
                 #     continue
 
-                pointsx = points[:,0,0]
-                pointsy = points[:,0,1]
+                pointsx = points[:, 0, 0]
+                pointsy = points[:, 0, 1]
 
                 shape = Shape(
-                    label='Object', # Default label
+                    label="Object",  # Default label
                     shape_type=shape_type,
                     group_id=self.getMaxId() + 1,
                 )
                 for point_index in range(pointsx.shape[0]):
-                    shape.addPoint(QtCore.QPointF(pointsx[point_index], pointsy[point_index]))
+                    shape.addPoint(
+                        QtCore.QPointF(pointsx[point_index], pointsy[point_index])
+                    )
                 shape.close()
-                
+
                 # SAMから出力された元のマスクデータを保存
-                setattr(shape, 'original_sam_mask', mask_for_shape_creation.copy())
-                
+                setattr(shape, "original_sam_mask", mask_for_shape_creation.copy())
+
                 tmp_sam_mask_shapes.append(shape)
-            
+
             if msk_idx == target_idx:
-                self.sam_mask = tmp_sam_mask_shapes 
+                self.sam_mask = tmp_sam_mask_shapes
             self.sam_mask_proposal.append(tmp_sam_mask_shapes)
 
     def filter_and_reconstruct_masks(self, masks_to_filter, area_threshold):
         if masks_to_filter is None or masks_to_filter.ndim != 3:
-            return np.array([]) # Return empty if input is not as expected
+            return np.array([])  # Return empty if input is not as expected
 
         num_masks, h, w = masks_to_filter.shape
         # Ensure the output array is correctly initialized for boolean or uint8 masks
@@ -2494,29 +2870,43 @@ class MainWindow(QMainWindow):
         for i in range(num_masks):
             current_mask_slice = masks_to_filter[i]
             # Ensure current_mask_slice is C-contiguous and uint8 for findContours
-            current_mask_contiguous = np.ascontiguousarray(current_mask_slice, dtype=np.uint8)
-            
-            contours, _ = cv2.findContours(current_mask_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            current_mask_contiguous = np.ascontiguousarray(
+                current_mask_slice, dtype=np.uint8
+            )
 
-            if not contours: # No contours found for this mask slice
+            contours, _ = cv2.findContours(
+                current_mask_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            if not contours:  # No contours found for this mask slice
                 continue
 
             valid_contours = []
-            for contour in contours: # Iterate through all found external contours for this mask slice
+            for contour in (
+                contours
+            ):  # Iterate through all found external contours for this mask slice
                 area = cv2.contourArea(contour)
-                if area >= area_threshold: # Apply threshold to ALL contours
+                if area >= area_threshold:  # Apply threshold to ALL contours
                     valid_contours.append(contour)
-            
-            if valid_contours: # If any contours passed the threshold
+
+            if valid_contours:  # If any contours passed the threshold
                 # Draw all valid contours onto the new mask for this index
-                cv2.drawContours(filtered_reconstructed_masks[i], valid_contours, -1, (255), thickness=cv2.FILLED)
+                cv2.drawContours(
+                    filtered_reconstructed_masks[i],
+                    valid_contours,
+                    -1,
+                    (255),
+                    thickness=cv2.FILLED,
+                )
             # If no valid_contours, filtered_reconstructed_masks[i] remains all zeros, which is correct (empty mask)
-                
+
         return filtered_reconstructed_masks
 
     def addSamMask(self):
         if len(self.sam_mask) > 0:
-            label = self.default_label if self.default_label else 'Object'  # 自動設定ラベルを使用
+            label = (
+                self.default_label if self.default_label else "Object"
+            )  # 自動設定ラベルを使用
             group_id = self.getMaxId() + 1
             if self.class_on_flag:
                 xx = self.labelDialog.popUp(
@@ -2525,45 +2915,43 @@ class MainWindow(QMainWindow):
                     group_id=group_id,
                 )
                 if len(xx) == 4:
-                    label, _, group_id,_ = xx
+                    label, _, group_id, _ = xx
                 else:
                     label, _, group_id = xx
             if label is None:
-                label = 'Object'
+                label = "Object"
             if not isinstance(group_id, int):
-                group_id=self.getMaxId() + 1
-            
+                group_id = self.getMaxId() + 1
+
             # 各マスクにラベルとグループIDを設定してaddLabelで追加
             for sam_mask in self.sam_mask:
                 sam_mask.label = label
                 sam_mask.group_id = group_id
                 self.addLabel(sam_mask)
-            
+
             # 現在の入力状態をクリア
             self.canvas.currentBox = None
             self.canvas.currentPos = None
             self.canvas.currentNeg = None
-            
+
             # プロポーザルをクリア
             self.show_proposals()
-            
+
             # ここでは sam_mask はクリアせず、最後に一括でクリアする
             # まずshapesに追加されたマスクをキャンバスにロード
             self.canvas.loadShapes([item.shape() for item in self.labelList])
-            
+
             # UIの状態を更新
             self.actions.save.setEnabled(True)
             self.actions.editMode.setEnabled(True)
-            
+
             # マスク表示確認のための強制描画更新
             self.canvas.update()
             QtWidgets.QApplication.processEvents()
-            
+
             # マスク情報をクリア（描画が確実に行われた後）
             self.sam_mask = []
             self.sam_mask_proposal = []
-
-
 
     def cleanPrompt(self):
         self.canvas.currentBox = None
@@ -2576,8 +2964,6 @@ class MainWindow(QMainWindow):
         self.canvas.setHiding()
         self.canvas.update()
         self.actions.editMode.setEnabled(True)
-
-
 
     def zoomRequest(self, delta, pos):
         canvas_width_old = self.canvas.width()
@@ -2619,7 +3005,7 @@ class MainWindow(QMainWindow):
             text = items[0].data(Qt.UserRole)
         flags = {}
         group_id = None
-        
+
         # Manual Polygonの場合、デフォルトラベルを使用
         if self.canvas.createMode == "polygon" and self.default_label:
             text = self.default_label
@@ -2646,11 +3032,11 @@ class MainWindow(QMainWindow):
             self.labelList.clearSelection()
             shape = self.canvas.setLastLabel(text, flags)
             shape.group_id = group_id
-            
+
             # Manual Polygonで描画された場合、ポリゴンからマスクを生成
             if self.canvas.createMode == "polygon" and shape.shape_type == "polygon":
                 self.generateMaskFromPolygon(shape)
-            
+
             self.addLabel(shape)
             self.actions.editMode.setEnabled(True)
             self.actions.undoLastPoint.setEnabled(False)
@@ -2705,6 +3091,7 @@ class MainWindow(QMainWindow):
         # self.actions.undoLastPoint.setEnabled(drawing)
         # self.actions.undo.setEnabled(not drawing)
         # self.actions.delete.setEnabled(not drawing)
+
     def setScroll(self, orientation, value):
         self.scrollBars[orientation].setValue(int(value))
         self.scroll_values[orientation][self.current_img] = value
@@ -2761,17 +3148,16 @@ class MainWindow(QMainWindow):
                 self.canvas.deSelectShape()
 
     def iou(self, target_mask, mask_list):
-        target_mask = target_mask.reshape(1,-1)
+        target_mask = target_mask.reshape(1, -1)
         mask_list = mask_list.reshape(mask_list.shape[0], -1)
-        i = (target_mask * mask_list)
+        i = target_mask * mask_list
         u = target_mask + mask_list - i
-        return i.sum(1)/u.sum(1)
+        return i.sum(1) / u.sum(1)
 
-
-    def polygon2mask(self,polygon, size):
-        mask = np.zeros((size)) # h,w
+    def polygon2mask(self, polygon, size):
+        mask = np.zeros((size))  # h,w
         contours = np.array(polygon)
-        mask = cv2.fillPoly(mask, [contours.astype(np.int32)],1)
+        mask = cv2.fillPoly(mask, [contours.astype(np.int32)], 1)
         return mask.astype(np.uint8)
 
     def mask2polygon(self, mask):
@@ -2785,27 +3171,29 @@ class MainWindow(QMainWindow):
     def generateMaskFromPolygon(self, shape):
         """
         Manual Polygonで描画された形状からマスクを生成し、original_sam_maskとして保存する
-        
+
         Args:
             shape: 描画された多角形のShapeオブジェクト
         """
         if not shape.points or len(shape.points) < 3:
             return
-        
+
         # 画像サイズを取得
-        if not hasattr(self, 'raw_h') or not hasattr(self, 'raw_w'):
+        if not hasattr(self, "raw_h") or not hasattr(self, "raw_w"):
             return
-        
+
         # ポリゴンの点を配列に変換
         polygon_points = [[p.x(), p.y()] for p in shape.points]
-        
+
         # polygon2maskメソッドを使用してマスクを生成
         mask = self.polygon2mask(polygon_points, (self.raw_h, self.raw_w))
-        
+
         # 生成したマスクをoriginal_sam_maskとして保存
-        setattr(shape, 'original_sam_mask', mask)
-        
-        print(f"Generated mask from manual polygon for {shape.label} (size: {mask.shape})")
+        setattr(shape, "original_sam_mask", mask)
+
+        print(
+            f"Generated mask from manual polygon for {shape.label} (size: {mask.shape})"
+        )
 
     def editLabel(self, item=None):
         if item and not isinstance(item, LabelListWidgetItem):
@@ -2826,7 +3214,7 @@ class MainWindow(QMainWindow):
             group_id=shape.group_id,
         )
         if len(xx) == 4:
-            text, flags, group_id,_ = xx
+            text, flags, group_id, _ = xx
         else:
             text, flags, group_id = xx
         if text is None:
@@ -2949,6 +3337,7 @@ class MainWindow(QMainWindow):
         残りで再集計する。CSVが追記式で削除に追随しない問題への対策。"""
         try:
             import pandas as pd
+
             if not self.current_output_dir or not self.current_img:
                 return
             experiment_params = {
@@ -2969,9 +3358,8 @@ class MainWindow(QMainWindow):
             if "画像ファイル名" not in df.columns or "二次粒子ID" not in df.columns:
                 return
             img = os.path.basename(self.current_img)
-            mask = (
-                (df["画像ファイル名"].astype(str) == img)
-                & (df["二次粒子ID"].astype(str) == str(secondary_group_id))
+            mask = (df["画像ファイル名"].astype(str) == img) & (
+                df["二次粒子ID"].astype(str) == str(secondary_group_id)
             )
             if not mask.any():
                 return
@@ -2994,17 +3382,18 @@ class MainWindow(QMainWindow):
         （測定後にパラメータを変えても正しいCSVを消せるようにするため）。削除はまとめて1回だけ再集計する。"""
         try:
             import pandas as pd
+
             if not self.current_output_dir or not self.current_img:
                 return
             img = os.path.basename(self.current_img)
             drop_group_ids = set()
             drop_primary_ids = set()
             for sh in deleted_shapes:
-                label = getattr(sh, 'label', '')
-                if label == 'secondary':
+                label = getattr(sh, "label", "")
+                if label == "secondary":
                     drop_group_ids.add(str(sh.group_id))
-                elif label == 'primary':
-                    pid = getattr(sh, 'particle_id', None)
+                elif label == "primary":
+                    pid = getattr(sh, "particle_id", None)
                     if pid is not None:
                         drop_primary_ids.add(str(pid))
             if not drop_group_ids and not drop_primary_ids:
@@ -3023,14 +3412,26 @@ class MainWindow(QMainWindow):
                     continue  # このCSVに現在画像の行は無い
                 drop_mask = pd.Series(False, index=df.index)
                 if drop_group_ids and "二次粒子ID" in df.columns:
-                    drop_mask |= img_mask & df["二次粒子ID"].astype(str).isin(drop_group_ids)
-                if drop_primary_ids and "一次粒子ID" in df.columns and "粒子形態" in df.columns:
-                    drop_mask |= img_mask & (df["粒子形態"].astype(str) == "primary") & df["一次粒子ID"].astype(str).isin(drop_primary_ids)
+                    drop_mask |= img_mask & df["二次粒子ID"].astype(str).isin(
+                        drop_group_ids
+                    )
+                if (
+                    drop_primary_ids
+                    and "一次粒子ID" in df.columns
+                    and "粒子形態" in df.columns
+                ):
+                    drop_mask |= (
+                        img_mask
+                        & (df["粒子形態"].astype(str) == "primary")
+                        & df["一次粒子ID"].astype(str).isin(drop_primary_ids)
+                    )
                 if not drop_mask.any():
                     continue
                 df = df[~drop_mask]
                 df.to_csv(csv_path, index=False)
-                print(f"CSVから削除行を除去しました: {os.path.basename(csv_path)} ({int(drop_mask.sum())}行)")
+                print(
+                    f"CSVから削除行を除去しました: {os.path.basename(csv_path)} ({int(drop_mask.sum())}行)"
+                )
                 if len(df) > 0:
                     CrystallizationAnalysis(csv_path, self.current_output_dir)(
                         rank_range_min=-50, rank_range_max=750, rank_range_width=50
@@ -3043,21 +3444,23 @@ class MainWindow(QMainWindow):
         # 選択されたシェイプが存在しない場合は何もしない
         if not self.canvas.selectedShapes:
             return
-        
+
         # 削除前のデータ保存
         shapes_to_delete = self.canvas.selectedShapes.copy()
-        
+
         # まず、secondaryシェイプが含まれているか確認
         for shape in shapes_to_delete:
             if shape.label == "secondary":
                 try:
                     # 関連するprimaryを元に戻す処理
-                    primary_segment_ids = getattr(shape, 'primary_segment_ids', [])
-                    primary_particle_ids = getattr(shape, 'primary_particle_ids', [])
+                    primary_segment_ids = getattr(shape, "primary_segment_ids", [])
+                    primary_particle_ids = getattr(shape, "primary_particle_ids", [])
                     secondary_group_id = shape.group_id
-                    
+
                     # primaryを元に戻してから削除（両方のIDリストを使用）
-                    all_primary_ids = primary_segment_ids + [str(pid) for pid in primary_particle_ids]
+                    all_primary_ids = primary_segment_ids + [
+                        str(pid) for pid in primary_particle_ids
+                    ]
                     self._restorePrimarySegments(all_primary_ids, secondary_group_id)
                 except Exception as e:
                     print(f"Error restoring primaries: {e}")
@@ -3081,50 +3484,57 @@ class MainWindow(QMainWindow):
     def _restorePrimarySegments(self, primary_ids, secondary_group_id):
         """
         primaryセグメントを元のマスク表示に戻す
-        
+
         Args:
             primary_ids: 復元するprimaryセグメントのID配列（文字列または数値のリスト）
             secondary_group_id: 関連するsecondaryグループID
         """
         # デバッグ情報
-        print(f"Restoring primaries: {primary_ids} from secondary: {secondary_group_id}")
-        
+        print(
+            f"Restoring primaries: {primary_ids} from secondary: {secondary_group_id}"
+        )
+
         # 復元されたシェイプを追跡
         restored = False
-        
+
         for shape in self.canvas.shapes:
             # secondary_group_idが設定されているprimaryセグメントのみを対象とする
-            if hasattr(shape, 'secondary_group_id') and shape.secondary_group_id == secondary_group_id:
+            if (
+                hasattr(shape, "secondary_group_id")
+                and shape.secondary_group_id == secondary_group_id
+            ):
                 print(f"Found shape with secondary_group_id: {secondary_group_id}")
-                
+
                 # 元のポイントと形状を復元
-                if hasattr(shape, 'original_points') and hasattr(shape, 'original_shape_type'):
+                if hasattr(shape, "original_points") and hasattr(
+                    shape, "original_shape_type"
+                ):
                     # ポイントを復元
                     shape.points.clear()
                     for point in shape.original_points:
                         shape.points.append(point)
-                    
+
                     shape.shape_type = shape.original_shape_type
                     shape.close()  # 形状を閉じる
-                    
+
                     # マスク表示をON
-                    setattr(shape, 'is_mask_visible', True)
-                    
+                    setattr(shape, "is_mask_visible", True)
+
                     # secondary_group_id属性をクリア
-                    if hasattr(shape, 'secondary_group_id'):
-                        delattr(shape, 'secondary_group_id')
-                    
+                    if hasattr(shape, "secondary_group_id"):
+                        delattr(shape, "secondary_group_id")
+
                     # original属性もクリア
-                    if hasattr(shape, 'original_points'):
-                        delattr(shape, 'original_points')
-                    if hasattr(shape, 'original_shape_type'):
-                        delattr(shape, 'original_shape_type')
-                    
+                    if hasattr(shape, "original_points"):
+                        delattr(shape, "original_points")
+                    if hasattr(shape, "original_shape_type"):
+                        delattr(shape, "original_shape_type")
+
                     # 見た目を更新
                     self._update_shape_color(shape)
                     restored = True
                     print("Restored shape to original mask form")
-        
+
         # キャンバス全体を更新
         if restored:
             self.canvas.update()
@@ -3150,28 +3560,37 @@ class MainWindow(QMainWindow):
                 )
             )
             return data
+
         shapes = self.current_img
         shapes = [format_shape(item.shape()) for item in self.labelList.selectedItems()]
         rm_shapes = [item.shape() for item in self.labelList.selectedItems()]
         self.remLabels(rm_shapes)
         for shape in shapes:
-            points = shape['points']
+            points = shape["points"]
             min_dis = self.get_min_dis(points)
             points_new = [points[0]]
-            for i in range(1,len(points)):
-                d = math.sqrt((points[i][0] - points_new[-1][0]) ** 2 + (points[i][1] - points_new[-1][1]) ** 2)
+            for i in range(1, len(points)):
+                d = math.sqrt(
+                    (points[i][0] - points_new[-1][0]) ** 2
+                    + (points[i][1] - points_new[-1][1]) ** 2
+                )
                 if d > (min_dis * 1.5):
                     points_new.append(points[i])
-            shape['points'] = points_new
-        #self.labelList.clear()
+            shape["points"] = points_new
+        # self.labelList.clear()
         for tmp_shape in shapes:
             shape = Shape(
-                label=tmp_shape['label'],
-                shape_type=tmp_shape['shape_type'],
-                group_id=tmp_shape['group_id'],
+                label=tmp_shape["label"],
+                shape_type=tmp_shape["shape_type"],
+                group_id=tmp_shape["group_id"],
             )
-            for point_index in range(len(tmp_shape['points'])):
-                shape.addPoint(QtCore.QPointF(tmp_shape['points'][point_index][0], tmp_shape['points'][point_index][1]))
+            for point_index in range(len(tmp_shape["points"])):
+                shape.addPoint(
+                    QtCore.QPointF(
+                        tmp_shape["points"][point_index][0],
+                        tmp_shape["points"][point_index][1],
+                    )
+                )
             shape.close()
             self.addLabel(shape)
             tmp_item = self.labelList.findItemByShape(shape)
@@ -3184,13 +3603,14 @@ class MainWindow(QMainWindow):
         min_dis = 10000
         if len(points) >= 2:
             points_new = [points[0]]
-            for i in range(1,len(points)):
-                d = math.sqrt((points[i][0] - points_new[-1][0]) ** 2 + (points[i][1] - points_new[-1][1]) ** 2)
+            for i in range(1, len(points)):
+                d = math.sqrt(
+                    (points[i][0] - points_new[-1][0]) ** 2
+                    + (points[i][1] - points_new[-1][1]) ** 2
+                )
                 min_dis = min(min_dis, d)
                 points_new.append(points[i])
         return min_dis
-
-
 
     def pasteSelectedShape(self):
         self.loadShapes(self._copied_shapes, replace=False)
@@ -3210,7 +3630,6 @@ class MainWindow(QMainWindow):
         for shape in shapes:
             item = self.labelList.findItemByShape(shape)
             self.labelList.removeItem(item)
-
 
     def noShapes(self):
         return not len(self.labelList)
@@ -3236,11 +3655,11 @@ class MainWindow(QMainWindow):
     def _processSelectedSegments(self, selected_segments):
         """
         選択されたセグメントを処理し、グループ化と境界ボックスの計算を行う
-        
+
         Args:
             selected_segments: 処理対象のセグメントリスト
             current_group_id: 新しいグループID
-        
+
         Returns:
             box: バウンディングボックス座標 [min_x, min_y, max_x, max_y]
             all_points: すべてのセグメントの点のリスト
@@ -3250,28 +3669,28 @@ class MainWindow(QMainWindow):
         primary_ids = []
         segment_ids = []
         all_points = []
-        
+
         # バウンディングボックスの最小値と最大値を初期化
-        min_x = float('inf')
-        min_y = float('inf')
-        max_x = float('-inf')
-        max_y = float('-inf')
-        
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+
         for segment in selected_segments:
             # 一次粒子IDを記録 - IDを変更せずに保持
-            particle_id = getattr(segment, 'particle_id', None)
+            particle_id = getattr(segment, "particle_id", None)
             if particle_id is not None:
                 primary_ids.append(particle_id)
-            
+
             # セグメントのIDを記録
-            seg_id = getattr(segment, 'id', None) or getattr(segment, 'group_id', None)
+            seg_id = getattr(segment, "id", None) or getattr(segment, "group_id", None)
             if seg_id is not None:
                 segment_ids.append(str(seg_id))
-            
+
             # グループ分けされたセグメントを保持
-            if hasattr(self, 'grouped_segments'):
+            if hasattr(self, "grouped_segments"):
                 self.grouped_segments.append(segment)
-            
+
             # セグメントのポイントを集め、境界ボックスを更新
             points = segment.points
             for point in points:
@@ -3281,7 +3700,7 @@ class MainWindow(QMainWindow):
                 min_y = min(min_y, py)
                 max_x = max(max_x, px)
                 max_y = max(max_y, py)
-        
+
         # 境界ボックスと関連情報を返す
         box = np.array([min_x, min_y, max_x, max_y])
         return box, all_points, primary_ids, segment_ids
@@ -3290,28 +3709,36 @@ class MainWindow(QMainWindow):
         # 選択されたセグメントの処理
         selected_segments = self.canvas.selectedShapes
         if not selected_segments:
-            QMessageBox.warning(self, "警告", "グループ化するセグメントを選択してください")
+            QMessageBox.warning(
+                self, "警告", "グループ化するセグメントを選択してください"
+            )
             return
-        
+
         # セグメントをグループ化して境界ボックスを計算
         bbox, all_points, primary_ids, segment_ids = self._processSelectedSegments(
             selected_segments
         )
         # primaryセグメントをOBBに変換して表示を更新
         primaries = self._convertPrimaryToOBB(selected_segments)
-        
+
         # secondaryセグメント（グループのOBB）を生成
         secondary_shape = self._createOBBShape(all_points, bbox, "secondary")
-        
+
         # SAMでsecondaryマスクを取得
         secondary_best_mask = None
-        if self.segmenter is not None and self.current_img:
-            img = cv2.imread(self.current_img)[:,:,::-1].copy()
+        if (
+            self.segmenter is not None
+            and not isinstance(self.segmenter, MatSamAdapter)
+            and self.current_img
+        ):
+            img = cv2.imread(self.current_img)[:, :, ::-1].copy()
             rh, rw = img.shape[:2]
             input_box = bbox
             img, input_box, _ = self.transform_input(img, box=input_box)
 
-            image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
+            image_key = build_image_key(
+                self.current_img, self.keep_input_size, self.max_size
+            )
             prediction = self._runPromptPrediction(
                 img,
                 image_key,
@@ -3322,17 +3749,17 @@ class MainWindow(QMainWindow):
             if prediction is None:
                 return
             masks, iou_prediction, _ = prediction
-            
-            masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
+
+            masks = self.transform_output(masks.astype(np.uint8), (rh, rw))
             target_idx = np.argmax(iou_prediction)
-            
+
             # 最適なマスクを選択
             secondary_best_mask = masks[target_idx]
-        
+
         # 関連付けられたプライマリーセグメントIDを記録
-        setattr(secondary_shape, 'primary_segment_ids', segment_ids)
-        setattr(secondary_shape, 'primary_particle_ids', primary_ids)
-        
+        setattr(secondary_shape, "primary_segment_ids", segment_ids)
+        setattr(secondary_shape, "primary_particle_ids", primary_ids)
+
         # セカンダリーグループを追加
         self.addLabel(secondary_shape)
 
@@ -3358,9 +3785,7 @@ class MainWindow(QMainWindow):
 
         # UI を更新
         self.show_proposals()
-        self.canvas.loadShapes(
-            [item.shape() for item in self.labelList]
-        )
+        self.canvas.loadShapes([item.shape() for item in self.labelList])
 
         # 選択されたセグメントをCSVにエクスポート
         self.exportSelectedSegmentsToCSV(
@@ -3375,12 +3800,12 @@ class MainWindow(QMainWindow):
         self.visualizeAllSecondaryParticles()
 
         # SAM2マスクをsecondary_shapeに保存
-        setattr(secondary_shape, 'original_sam_mask', secondary_best_mask)
+        setattr(secondary_shape, "original_sam_mask", secondary_best_mask)
 
     def _convertPrimaryToOBB(self, segments):
         """
         primaryセグメントをOBBに変換する
-        
+
         Args:
             segments: 変換対象のセグメントリスト
             group_id: グループID
@@ -3388,48 +3813,48 @@ class MainWindow(QMainWindow):
         primaries = []
         for segment in segments:
             # オリジナルのセグメント情報を保存
-            setattr(segment, 'original_points', segment.points.copy())
-            setattr(segment, 'original_shape_type', segment.shape_type)
-            setattr(segment, 'is_mask_visible', False)  # マスク表示をOFF
-            
+            setattr(segment, "original_points", segment.points.copy())
+            setattr(segment, "original_shape_type", segment.shape_type)
+            setattr(segment, "is_mask_visible", False)  # マスク表示をOFF
+
             # セグメントの点を抽出
             points = [(p.x(), p.y()) for p in segment.points]
             # OBB用の空のバウンディングボックス初期化
-            min_x, min_y = float('inf'), float('inf')
-            max_x, max_y = float('-inf'), float('-inf')
-            
+            min_x, min_y = float("inf"), float("inf")
+            max_x, max_y = float("-inf"), float("-inf")
+
             # 点からバウンディングボックスを計算
             for point in points:
                 min_x = min(min_x, point[0])
                 min_y = min(min_y, point[1])
                 max_x = max(max_x, point[0])
                 max_y = max(max_y, point[1])
-            
+
             # OBBに変換
             segment.points.clear()  # 既存の点をクリア
-            
+
             if len(points) >= 4:
                 # 最小面積の回転した長方形を計算
                 points_array = np.array(points, dtype=np.float32)
                 rect = cv2.minAreaRect(points_array)
                 box_points = cv2.boxPoints(rect)
-                
+
                 # OBBの頂点を追加
                 for point in box_points:
                     segment.addPoint(QtCore.QPointF(point[0], point[1]))
-                
+
                 segment.shape_type = "polygon"  # ポリゴンとして扱う
             else:
                 # 点が少ない場合は通常の矩形を使用
                 segment.addPoint(QtCore.QPointF(min_x, min_y))
                 segment.addPoint(QtCore.QPointF(max_x, max_y))
                 segment.shape_type = "rectangle"
-            
+
             segment.close()
-            
+
             # セカンダリーグループIDを関連付け
-            setattr(segment, 'secondary_group_id', self.group_id)
-            
+            setattr(segment, "secondary_group_id", self.group_id)
+
             primaries.append(segment)
 
             # 見た目を更新
@@ -3440,36 +3865,36 @@ class MainWindow(QMainWindow):
     def _createOBBShape(self, all_points, bbox, label_prefix):
         """
         点群からOBBを生成する
-        
+
         Args:
             all_points: 点の配列
             bbox: バウンディングボックス（min_x, min_y, max_x, max_y）
             group_id: グループID
             label_prefix: ラベルプレフィックス（"primary"または"secondary"）
-        
+
         Returns:
             生成されたShapeオブジェクト
         """
         min_x, min_y, max_x, max_y = bbox
-        
+
         if len(all_points) >= 4:  # 少なくとも4点が必要
             points_array = np.array(all_points, dtype=np.float32)
             # 最小面積の回転した長方形を計算
             rect = cv2.minAreaRect(points_array)
             # 長方形の4つの頂点を取得
             box_points = cv2.boxPoints(rect)
-            
+
             # OBBのシェイプを作成
             shape = Shape(
                 label=f"{label_prefix}",
                 shape_type="polygon",  # OBBはポリゴンとして扱う
                 group_id=self.group_id,
             )
-            
+
             # OBBの頂点を追加
             for point in box_points:
                 shape.addPoint(QtCore.QPointF(point[0], point[1]))
-            
+
         else:
             # 点が少ない場合は通常の矩形を使用
             shape = Shape(
@@ -3479,15 +3904,15 @@ class MainWindow(QMainWindow):
             )
             shape.addPoint(QtCore.QPointF(min_x, min_y))
             shape.addPoint(QtCore.QPointF(max_x, max_y))
-        
+
         shape.close()
-        
+
         # バウンディングボックスの見た目を設定
         r, g, b = self._get_rgb_by_label(self.group_id)
         shape.line_color = QtGui.QColor(r, g, b, 200)
         shape.vertex_fill_color = QtGui.QColor(r, g, b, 120)
         shape.fill_color = QtGui.QColor(r, g, b, 30)
-        
+
         return shape
 
     def exportSelectedSegmentsToCSV(
@@ -3500,41 +3925,45 @@ class MainWindow(QMainWindow):
         """
         選択されたセグメント（一次粒子）をグループ化した二次粒子としてCSVにエクスポートする
         一次粒子のラベルはそのまま保持し、グループ化情報のみを二次粒子として出力する
-        
+
         Args:
             primary_obbs: 一次粒子のOBBのリスト
             primary_masks: 一次粒子のマスクのリスト
             secondary_obb: 二次粒子のOBB頂点リスト
             secondary_mask: 二次粒子のマスク配列(numpy.ndarray)
         """
-        
+
         if not primary_obbs or not secondary_obb or not self.current_img:
-            QMessageBox.warning(self, self.tr("Warning"), self.tr("No segments selected or no image loaded"))
+            QMessageBox.warning(
+                self,
+                self.tr("Warning"),
+                self.tr("No segments selected or no image loaded"),
+            )
             return
-        
+
         # 画像ファイル名
         image_filename = os.path.basename(self.current_img)
-        
+
         # スケーリング係数を取得
         scale = float(self.image_scaler_edit.text() or "1.0")
-        
+
         # 一次粒子情報を収集
         primary_particles = []
         primary_ids = []
-        
-        # 通し番号用のカウンタ 
+
+        # 通し番号用のカウンタ
         # 既存の通し番号を継続するため、現在の最大IDを取得
         max_id = 0
         for shape in self.canvas.shapes:
-            if hasattr(shape, 'particle_id') and shape.particle_id is not None:
+            if hasattr(shape, "particle_id") and shape.particle_id is not None:
                 max_id = max(max_id, shape.particle_id)
-        
+
         # 各一次粒子の処理
         used_ids = set()  # グループ内でのID重複を防ぐ（重複するとdedupで行が落ちる）
         for idx, (segment, mask) in enumerate(zip(primary_obbs, primary_masks)):
             # 各セグメントに一意なIDを割り当て。
             # ID未設定、または同一グループ内で既に使われているID(複製由来など)の場合は再採番する。
-            _pid = getattr(segment, 'particle_id', None)
+            _pid = getattr(segment, "particle_id", None)
             if _pid is None or _pid in used_ids:
                 _pid = max_id + idx + 1
                 while _pid in used_ids:
@@ -3544,50 +3973,52 @@ class MainWindow(QMainWindow):
 
             particle_id = segment.particle_id
             primary_ids.append(particle_id)
-            
+
             # OBBの点を取得して長さを計算
             points = np.array([[p.x(), p.y()] for p in segment.points])
-            
+
             # OpenCVの関数で形状解析
             if len(points) >= 4:  # OBBは4点必要
                 # OBBから長さを計算
                 rect = cv2.minAreaRect(points.astype(np.float32))
                 (cx, cy), (width, height), angle = rect
-                
+
                 lmajor = max(width, height) * scale
                 lminor = min(width, height) * scale
                 mean_length = (lmajor + lminor) / 2
-                
+
                 # マスクから面積を計算
                 area = 0
                 if isinstance(mask, np.ndarray):
                     area = np.count_nonzero(mask) * scale**2
-                elif mask is not None and hasattr(mask, 'points'):
+                elif mask is not None and hasattr(mask, "points"):
                     mask_points = np.array([[p.x(), p.y()] for p in mask.points])
                     area = cv2.contourArea(mask_points.astype(np.int32)) * scale**2
                 else:
                     # 有効なマスクが無い場合は OBB から面積を概算
                     area = width * height * scale**2
-                
+
                 # 一次粒子情報を保存
-                primary_particles.append({
-                    "image_filename": image_filename,
-                    "particle_id": particle_id,
-                    "secondary_id": getattr(segment, 'secondary_group_id', ""),
-                    # NOTE:
-                    # CrystallizationAnalysis は「粒子形態」が primary/secondary の行を前提に
-                    # Lmean/Agg/n を再計算する。ここが "Object" 等になると primary が0件になり、
-                    # Lmean/Agg が NaN になってグラフ生成が落ちる。
-                    "particle_type": "primary",
-                    "label": segment.label,  # 元のラベルは別カラムに保持
-                    "Lmajor [um]": round(lmajor, 3),
-                    "Lminor [um]": round(lminor, 3),
-                    "L[um]": round(mean_length, 1),
-                    "Lmean[um]": "",
-                    "n": "",
-                    "Agg.": "",
-                    "Area[um^2]": round(area, 2),
-                })
+                primary_particles.append(
+                    {
+                        "image_filename": image_filename,
+                        "particle_id": particle_id,
+                        "secondary_id": getattr(segment, "secondary_group_id", ""),
+                        # NOTE:
+                        # CrystallizationAnalysis は「粒子形態」が primary/secondary の行を前提に
+                        # Lmean/Agg/n を再計算する。ここが "Object" 等になると primary が0件になり、
+                        # Lmean/Agg が NaN になってグラフ生成が落ちる。
+                        "particle_type": "primary",
+                        "label": segment.label,  # 元のラベルは別カラムに保持
+                        "Lmajor [um]": round(lmajor, 3),
+                        "Lminor [um]": round(lminor, 3),
+                        "L[um]": round(mean_length, 1),
+                        "Lmean[um]": "",
+                        "n": "",
+                        "Agg.": "",
+                        "Area[um^2]": round(area, 2),
+                    }
+                )
             elif len(points) >= 2:
                 # 矩形の対角2点から長さを計算
                 x1, y1 = points[0]
@@ -3603,7 +4034,7 @@ class MainWindow(QMainWindow):
                 area = 0
                 if isinstance(mask, np.ndarray):
                     area = np.count_nonzero(mask) * scale**2
-                elif mask is not None and hasattr(mask, 'points'):
+                elif mask is not None and hasattr(mask, "points"):
                     mask_points = np.array([[p.x(), p.y()] for p in mask.points])
                     area = cv2.contourArea(mask_points.astype(np.int32)) * scale**2
                 else:
@@ -3611,48 +4042,50 @@ class MainWindow(QMainWindow):
                     area = width * height * scale**2
 
                 # 一次粒子情報を保存
-                primary_particles.append({
-                    "image_filename": image_filename,
-                    "particle_id": particle_id,
-                    "secondary_id": getattr(segment, 'secondary_group_id', ""),
-                    # NOTE:
-                    # CrystallizationAnalysis は「粒子形態」が primary/secondary の行を前提に
-                    # Lmean/Agg/n を再計算する。ここが "Object" 等になると primary が0件になり、
-                    # Lmean/Agg が NaN になってグラフ生成が落ちる。
-                    "particle_type": "primary",
-                    "label": segment.label,  # 元のラベルは別カラムに保持
-                    "Lmajor [um]": round(lmajor, 3),
-                    "Lminor [um]": round(lminor, 3),
-                    "L[um]": round(mean_length, 1),
-                    "Lmean[um]": "",
-                    "n": "",
-                    "Agg.": "",
-                    "Area[um^2]": round(area, 2),
-                })
+                primary_particles.append(
+                    {
+                        "image_filename": image_filename,
+                        "particle_id": particle_id,
+                        "secondary_id": getattr(segment, "secondary_group_id", ""),
+                        # NOTE:
+                        # CrystallizationAnalysis は「粒子形態」が primary/secondary の行を前提に
+                        # Lmean/Agg/n を再計算する。ここが "Object" 等になると primary が0件になり、
+                        # Lmean/Agg が NaN になってグラフ生成が落ちる。
+                        "particle_type": "primary",
+                        "label": segment.label,  # 元のラベルは別カラムに保持
+                        "Lmajor [um]": round(lmajor, 3),
+                        "Lminor [um]": round(lminor, 3),
+                        "L[um]": round(mean_length, 1),
+                        "Lmean[um]": "",
+                        "n": "",
+                        "Agg.": "",
+                        "Area[um^2]": round(area, 2),
+                    }
+                )
             else:
                 primary_ids.pop()
-        
+
         # 二次粒子情報を計算
         if secondary_obb:
             # 二次粒子のOBB頂点から長さを計算
             secondary_points = np.array([[p.x(), p.y()] for p in secondary_obb.points])
-            
+
             # OBBから長さを計算
             rect = cv2.minAreaRect(secondary_points.astype(np.float32))
             (cx, cy), (width, height), angle = rect
-            
+
             lmajor_secondary = max(width, height) * scale
             lminor_secondary = min(width, height) * scale
             l_secondary = (lmajor_secondary + lminor_secondary) / 2
-            
+
             # 一次粒子の平均サイズを計算
             l_values = [p["L[um]"] for p in primary_particles]
             lmean = sum(l_values) / len(l_values) if l_values else 0
-            
+
             # 凝集度（Aggregation）の計算
             n_particles = len(primary_particles)
             aggregation = l_secondary / lmean if lmean > 0 else 0
-            
+
             # マスクから面積を計算
             total_area = 0
             if secondary_mask is not None:
@@ -3662,12 +4095,16 @@ class MainWindow(QMainWindow):
             else:
                 # マスクがない場合はOBBから面積を概算
                 total_area = width * height * scale**2
-            
+
             # 二次粒子情報を追加
             secondary_particle = {
                 "image_filename": image_filename,
-                "particle_id": ",".join(map(str, primary_ids)),  # コンマ区切りの一次粒子ID
-                "secondary_id": getattr(primary_obbs[0], 'secondary_group_id', "") if primary_obbs else "",
+                "particle_id": ",".join(
+                    map(str, primary_ids)
+                ),  # コンマ区切りの一次粒子ID
+                "secondary_id": getattr(primary_obbs[0], "secondary_group_id", "")
+                if primary_obbs
+                else "",
                 "particle_type": "secondary",  # 二次粒子としてマーク
                 "label": "secondary",
                 "Lmajor [um]": round(lmajor_secondary, 3),
@@ -3678,10 +4115,10 @@ class MainWindow(QMainWindow):
                 "Agg.": round(aggregation, 2),
                 "Area[um^2]": round(total_area, 2),
             }
-            
+
             # 全ての粒子情報を結合
             all_particles = primary_particles + [secondary_particle]
-            
+
             # 実験パラメータの取得
             experiment_params = {
                 "date": self.date_edit.text(),
@@ -3693,13 +4130,13 @@ class MainWindow(QMainWindow):
                 "suspension_density": self.suspension_density_edit.text(),
                 "image_scaler": self.image_scaler_edit.text(),
             }
-            
+
             # CSVにエクスポート（共通の出力ディレクトリを使用）
-            csv_path = csv_exporter.export_csv(all_particles, experiment_params, self.current_output_dir)
-            work_dir = self.current_output_dir
-            crystallization = CrystallizationAnalysis(
-                csv_path, work_dir
+            csv_path = csv_exporter.export_csv(
+                all_particles, experiment_params, self.current_output_dir
             )
+            work_dir = self.current_output_dir
+            crystallization = CrystallizationAnalysis(csv_path, work_dir)
             crystallization(rank_range_min=-50, rank_range_max=750, rank_range_width=50)
 
             # 測定ごとに実験パラメータ・スケールを永続化（再開時のCSV一本化のため）
@@ -3710,109 +4147,121 @@ class MainWindow(QMainWindow):
     def createMaskFromJsonData(self, shapes_data, img_shape, target_label=None):
         """
         JSONデータから直接マスク画像を生成する（SAMマスクまたはポリゴン領域を可視化）
-        
+
         Args:
             shapes_data: シェイプデータのリスト
             img_shape: 画像のサイズ (height, width)
             target_label: 対象とするラベル（"primary"/"secondary"など、Noneの場合は全て）
-        
+
         Returns:
             マスク画像（numpy配列）
         """
         height, width = img_shape[:2]
         mask = np.zeros((height, width, 3), dtype=np.uint8)
-        
+
         for shape_data in shapes_data:
             # target_labelが指定されている場合、そのラベルのみを処理
-            if target_label and shape_data.get('label') != target_label:
+            if target_label and shape_data.get("label") != target_label:
                 continue
-            
+
             # グループIDから色を決定
-            group_id = shape_data.get('group_id', 0)
+            group_id = shape_data.get("group_id", 0)
             color_idx = int(group_id) if isinstance(group_id, int) else 0
             color = LABEL_COLORMAP[color_idx % len(LABEL_COLORMAP)]
             color = (int(color[0]), int(color[1]), int(color[2]))
-            
+
             # ポリゴンベースの処理
             self._create_polygon_mask(shape_data, mask, color)
-        
+
         return mask
-    
+
     def _create_polygon_mask(self, shape_data, mask, color):
         """ポリゴンベースのマスク生成（フォールバック処理）"""
-        if 'points' not in shape_data or not shape_data['points']:
+        if "points" not in shape_data or not shape_data["points"]:
             return
-            
+
         # ポイントを numpy 配列に変換
-        points = np.array(shape_data['points'], dtype=np.int32)
-        
+        points = np.array(shape_data["points"], dtype=np.int32)
+
         # ポリゴン領域を塗りつぶし
         cv2.fillPoly(mask, [points], color)
-        
+
         # 輪郭線を描画（より明確に）
         cv2.polylines(mask, [points], isClosed=True, color=(255, 255, 255), thickness=2)
 
     def saveMaskAndBBoxImages(self, filename_base):
         """
         JSONファイルのpointsからマスク画像を生成して保存する
-        
+
         Args:
             filename_base: 保存するファイル名のベース部分（拡張子なし）
         """
         # JSONファイルが存在するかチェック
-        json_filename = filename_base + '.json' if not filename_base.endswith('.json') else filename_base
+        json_filename = (
+            filename_base + ".json"
+            if not filename_base.endswith(".json")
+            else filename_base
+        )
         if not os.path.exists(json_filename):
             return  # JSONファイルがない場合は何もしない
-        
+
         # JSONファイルからデータを読み込み
         try:
-            with open(json_filename, 'r') as f:
+            with open(json_filename, "r") as f:
                 data = json.load(f)
-            shapes_data = data.get('shapes', [])
+            shapes_data = data.get("shapes", [])
             if not shapes_data:
                 return  # シェイプデータがない場合は何もしない
         except Exception as e:
             print(f"Error loading JSON file: {e}")
             return
-        
+
         # マスク画像のみ保存（bbox出力は削除）
         if self.save_mask:
             mask_dir = self.getOutputSubDir("masks")
-            
+
             # 元画像を読み込み
             original_img = cv2.imread(self.current_img)
             original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
             height, width = original_img.shape[:2]
-            
+
             # primaryとsecondaryのラベルそれぞれでマスク画像を生成
             labels_to_process = ["primary", "secondary"]
-            
+
             for label in labels_to_process:
                 # 指定ラベルのシェイプが存在するかチェック
-                label_shapes = [shape for shape in shapes_data if shape.get('label') == label]
+                label_shapes = [
+                    shape for shape in shapes_data if shape.get("label") == label
+                ]
                 if not label_shapes:
                     continue  # 該当するラベルのシェイプがない場合はスキップ
-                
+
                 # JSONデータから指定ラベルのマスク画像を生成
-                mask_img = self.createMaskFromJsonData(shapes_data, (height, width), target_label=label)
-                
+                mask_img = self.createMaskFromJsonData(
+                    shapes_data, (height, width), target_label=label
+                )
+
                 # 合成画像の作成（元画像 + マスク画像）
                 # マスク領域の透明度を設定
                 alpha = 0.6
                 composite_img = original_img.copy()
-                
+
                 # マスクが存在する領域を見つける
                 mask_areas = np.any(mask_img > 0, axis=2)
-                
+
                 # マスクがある領域だけ合成
                 composite_img[mask_areas] = (
-                    alpha * mask_img[mask_areas] + 
-                    (1 - alpha) * original_img[mask_areas]
+                    alpha * mask_img[mask_areas]
+                    + (1 - alpha) * original_img[mask_areas]
                 ).astype(np.uint8)
-                
+
                 # 合成画像の保存（ラベル名を含むファイル名）
-                mask_filename = os.path.join(mask_dir, f"{os.path.basename(filename_base)}_{label}_mask.jpg")
-                cv2.imwrite(mask_filename, cv2.cvtColor(composite_img, cv2.COLOR_RGB2BGR))
+                mask_filename = os.path.join(
+                    mask_dir, f"{os.path.basename(filename_base)}_{label}_mask.jpg"
+                )
+                cv2.imwrite(
+                    mask_filename, cv2.cvtColor(composite_img, cv2.COLOR_RGB2BGR)
+                )
 
     def deleteShape(self, shape):
         if shape in self.selectedShapes:
@@ -3828,20 +4277,22 @@ class MainWindow(QMainWindow):
         """
         if not self.current_img:
             return
-        
+
         # canvas上のsecondaryラベルを持つ形状を見つける
-        secondary_shapes = [shape for shape in self.canvas.shapes if shape.label == 'secondary']
-        
+        secondary_shapes = [
+            shape for shape in self.canvas.shapes if shape.label == "secondary"
+        ]
+
         if not secondary_shapes:
             return
-        
+
         # すべての二次粒子を1枚の画像にまとめて可視化
         self.visualizeSecondaryMaskAndL(secondary_shapes, None, suffix="")
 
     def visualizeSecondaryMaskAndL(self, secondary_shapes, secondary_mask, suffix=""):
         """
         secondaryマスクとL値（長軸・短軸）を可視化する
-        
+
         Args:
             secondary_shapes: 二次粒子のShapeオブジェクトのリストまたは単一のShapeオブジェクト
             secondary_mask: 二次粒子のマスク画像（使用されない）
@@ -3849,68 +4300,70 @@ class MainWindow(QMainWindow):
         """
         if secondary_shapes is None or not self.current_img:
             return
-        
+
         # 単一のShapeオブジェクトの場合はリストに変換
         if not isinstance(secondary_shapes, list):
             secondary_shapes = [secondary_shapes]
-        
+
         if not secondary_shapes:
             return
-        
-                # 元画像の読み込み
+
+            # 元画像の読み込み
         original_img = cv2.imread(self.current_img)
         original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
         h, w = original_img.shape[:2]
-        
+
         # 可視化用の画像を作成（元画像のコピー）
         visualization_img = original_img.copy()
-        
+
         # スケーリング係数を取得
         scale = float(self.image_scaler_edit.text() or "1.0")
-        
+
         # 各二次粒子を処理
         for i, secondary_shape in enumerate(secondary_shapes):
             # Shapeオブジェクトから点を取得
-            points = np.array([[p.x(), p.y()] for p in secondary_shape.points], dtype=np.int32)
-            group_id = getattr(secondary_shape, 'group_id', 0)
-            
+            points = np.array(
+                [[p.x(), p.y()] for p in secondary_shape.points], dtype=np.int32
+            )
+            group_id = getattr(secondary_shape, "group_id", 0)
+
             # 色を決定
             color_idx = int(group_id) if isinstance(group_id, int) else 0
             color = LABEL_COLORMAP[color_idx % len(LABEL_COLORMAP)]
             mask_color = (int(color[0]), int(color[1]), int(color[2]))
-            
+
             # 1. マスクの可視化（半透明のオーバーレイ）
             # 単一の形状のマスクを生成
             single_mask = np.zeros((h, w, 3), dtype=np.uint8)
             cv2.fillPoly(single_mask, [points], mask_color)
-            
+
             # 半透明合成
             alpha = 0.4  # 透明度
             mask_areas = np.any(single_mask > 0, axis=2)
             visualization_img[mask_areas] = (
-                alpha * single_mask[mask_areas] + 
-                (1 - alpha) * visualization_img[mask_areas]
+                alpha * single_mask[mask_areas]
+                + (1 - alpha) * visualization_img[mask_areas]
             ).astype(np.uint8)
-            
+
             # 2. OBBの可視化と長軸・短軸の描画
-            
+
             # OBBを描画
             cv2.drawContours(visualization_img, [points], 0, (0, 255, 0), 2)
-            
+
             # OBBの中心点を計算
             cx = np.mean(points[:, 0])
             cy = np.mean(points[:, 1])
-            
+
             # 対角点のペアを計算（0-2と1-3が対角）
             if len(points) >= 4:  # OBBの場合のみ長軸・短軸を計算
                 # 辺の長さを計算
                 edge1 = np.linalg.norm(points[0] - points[1])
                 edge2 = np.linalg.norm(points[1] - points[2])
-                
+
                 # 長軸と短軸の長さを特定
                 lmajor = max(edge1, edge2) * scale
                 lminor = min(edge1, edge2) * scale
-                
+
                 # 長軸と短軸のベクトルを計算
                 if edge1 > edge2:
                     # edge1が長軸の場合
@@ -3920,55 +4373,70 @@ class MainWindow(QMainWindow):
                     # edge2が長軸の場合
                     major_vec = points[2] - points[1]
                     minor_vec = points[1] - points[0]
-                
+
                 # ベクトルの正規化
-                major_vec = major_vec / np.linalg.norm(major_vec) * max(edge1, edge2) / 2
-                minor_vec = minor_vec / np.linalg.norm(minor_vec) * min(edge1, edge2) / 2
-                
+                major_vec = (
+                    major_vec / np.linalg.norm(major_vec) * max(edge1, edge2) / 2
+                )
+                minor_vec = (
+                    minor_vec / np.linalg.norm(minor_vec) * min(edge1, edge2) / 2
+                )
+
                 # 長軸の描画（赤い矢印）
                 start_major = (int(cx), int(cy))
                 end_major = (int(cx + major_vec[0]), int(cy + major_vec[1]))
-                cv2.arrowedLine(visualization_img, start_major, end_major, (255, 0, 0), 2)
-                
+                cv2.arrowedLine(
+                    visualization_img, start_major, end_major, (255, 0, 0), 2
+                )
+
                 # 反対側の矢印も描画
                 end_major_opposite = (int(cx - major_vec[0]), int(cy - major_vec[1]))
-                cv2.arrowedLine(visualization_img, start_major, end_major_opposite, (255, 0, 0), 2)
-                
+                cv2.arrowedLine(
+                    visualization_img, start_major, end_major_opposite, (255, 0, 0), 2
+                )
+
                 # 短軸の描画（青い矢印）
                 start_minor = (int(cx), int(cy))
                 end_minor = (int(cx + minor_vec[0]), int(cy + minor_vec[1]))
-                cv2.arrowedLine(visualization_img, start_minor, end_minor, (0, 0, 255), 2)
-                
+                cv2.arrowedLine(
+                    visualization_img, start_minor, end_minor, (0, 0, 255), 2
+                )
+
                 # 反対側の矢印も描画
                 end_minor_opposite = (int(cx - minor_vec[0]), int(cy - minor_vec[1]))
-                cv2.arrowedLine(visualization_img, start_minor, end_minor_opposite, (0, 0, 255), 2)
-                
+                cv2.arrowedLine(
+                    visualization_img, start_minor, end_minor_opposite, (0, 0, 255), 2
+                )
+
                 # L値のテキスト表示（各粒子に番号を付ける）
                 text_offset_y = i * 40  # 各粒子のテキストを縦にずらす
                 cv2.putText(
-                    visualization_img, 
-                    f"Lmajor: {lmajor:.1f} um", 
-                    (int(cx) + 20, int(cy) - 20 + text_offset_y), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.6, 
-                    (255, 0, 0), 
-                    2
+                    visualization_img,
+                    f"Lmajor: {lmajor:.1f} um",
+                    (int(cx) + 20, int(cy) - 20 + text_offset_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 0, 0),
+                    2,
                 )
                 cv2.putText(
-                    visualization_img, 
-                    f"Lminor: {lminor:.1f} um", 
-                    (int(cx) + 20, int(cy) + 10 + text_offset_y), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.6, 
-                    (0, 0, 255), 
-                    2
+                    visualization_img,
+                    f"Lminor: {lminor:.1f} um",
+                    (int(cx) + 20, int(cy) + 10 + text_offset_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
                 )
-        
+
         # 共通の出力ディレクトリ管理メソッドを使用
         output_dir = self.getOutputSubDir("visualizations")
-        
+
         image_basename = os.path.basename(self.current_img)
-        filename = os.path.join(output_dir, f"{os.path.splitext(image_basename)[0]}_secondary_viz{suffix}.jpg")
+        filename = os.path.join(
+            output_dir,
+            f"{os.path.splitext(image_basename)[0]}_secondary_viz{suffix}.jpg",
+        )
         cv2.imwrite(filename, cv2.cvtColor(visualization_img, cv2.COLOR_RGB2BGR))
 
     def update_area_threshold(self, value):
@@ -3978,7 +4446,7 @@ class MainWindow(QMainWindow):
 
     def filter_and_reconstruct_masks(self, masks_to_filter, area_threshold):  # noqa: F811
         if masks_to_filter is None or masks_to_filter.ndim != 3:
-            return np.array([]) # Return empty if input is not as expected
+            return np.array([])  # Return empty if input is not as expected
 
         num_masks, h, w = masks_to_filter.shape
         # Ensure the output array is correctly initialized for boolean or uint8 masks
@@ -3987,24 +4455,36 @@ class MainWindow(QMainWindow):
         for i in range(num_masks):
             current_mask_slice = masks_to_filter[i]
             # Ensure current_mask_slice is C-contiguous and uint8 for findContours
-            current_mask_contiguous = np.ascontiguousarray(current_mask_slice, dtype=np.uint8)
-            
-            contours, _ = cv2.findContours(current_mask_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            current_mask_contiguous = np.ascontiguousarray(
+                current_mask_slice, dtype=np.uint8
+            )
 
-            if not contours: # No contours found for this mask slice
+            contours, _ = cv2.findContours(
+                current_mask_contiguous, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            if not contours:  # No contours found for this mask slice
                 continue
 
             valid_contours = []
-            for contour in contours: # Iterate through all found external contours for this mask slice
+            for contour in (
+                contours
+            ):  # Iterate through all found external contours for this mask slice
                 area = cv2.contourArea(contour)
-                if area >= area_threshold: # Apply threshold to ALL contours
+                if area >= area_threshold:  # Apply threshold to ALL contours
                     valid_contours.append(contour)
-            
-            if valid_contours: # If any contours passed the threshold
+
+            if valid_contours:  # If any contours passed the threshold
                 # Draw all valid contours onto the new mask for this index
-                cv2.drawContours(filtered_reconstructed_masks[i], valid_contours, -1, (255), thickness=cv2.FILLED)
+                cv2.drawContours(
+                    filtered_reconstructed_masks[i],
+                    valid_contours,
+                    -1,
+                    (255),
+                    thickness=cv2.FILLED,
+                )
             # If no valid_contours, filtered_reconstructed_masks[i] remains all zeros, which is correct (empty mask)
-                
+
         return filtered_reconstructed_masks
 
     def closeEvent(self, event):
@@ -4014,69 +4494,62 @@ class MainWindow(QMainWindow):
             self.segmenter = None
         super().closeEvent(event)
 
+
 def get_parser():
     parser = argparse.ArgumentParser(description="pixel annotator by GroundedSAM")
     parser.add_argument(
         "--app_resolution",
-        default='1000,1600',
-        help="Application window resolution in format 'height,width'"
+        default="1000,1600",
+        help="Application window resolution in format 'height,width'",
+    )
+    parser.add_argument("--model_type", default="vit_b", help="Model type for SAM")
+    parser.add_argument(
+        "--keep_input_size", type=bool, default=True, help="Keep original input size"
     )
     parser.add_argument(
-        "--model_type",
-        default='vit_b',
-        help="Model type for SAM"
+        "--max_size", default=720, help="Maximum size for image scaling"
     )
-    parser.add_argument(
-        "--keep_input_size",
-        type=bool,
-        default=True,
-        help="Keep original input size"
-    )   
-    parser.add_argument(
-        "--max_size",
-        default=720,
-        help="Maximum size for image scaling"
-    )
-    parser.add_argument(
-        "--category_file",
-        default=None,
-        help="Path to category file"
-    )
+    parser.add_argument("--category_file", default=None, help="Path to category file")
     parser.add_argument(
         "--save_mask",
         action="store_true",
         default=True,
-        help="Save segmentation mask images"
+        help="Save segmentation mask images",
     )
     parser.add_argument(
         "--save_bbox",
         action="store_true",
         default=False,
-        help="Save bounding box visualization images"
+        help="Save bounding box visualization images",
     )
     parser.add_argument(
         "--save_labels",
         action="store_false",
         default=True,
-        help="Save annotation labels as JSON files"
+        help="Save annotation labels as JSON files",
     )
     parser.add_argument(
         "--image_directory",
         default=None,
-        help="Directory containing images to annotate"
+        help="Directory containing images to annotate",
     )
     parser.add_argument(
         "--sam_model",
-        default='large',
-        choices=['tiny', 'small', 'base_plus', 'large'],
-        help="読み込むSAM2モデルのサイズ (tiny/small/base_plus/large)"
+        default="large",
+        choices=[
+            *SAM2_MODEL_SPECS,
+            *MICRO_SAM_MODEL_NAMES,
+            *MATSAM_MODEL_NAMES,
+        ],
+        help="読み込むSAMモデル",
     )
     return parser
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
-    global_h, global_w = [int(i) for i in args.app_resolution.split(',')]
+    global_h, global_w = [int(i) for i in args.app_resolution.split(",")]
     model_type = args.model_type
     keep_input_size = args.keep_input_size
     max_size = args.max_size
@@ -4102,7 +4575,7 @@ if __name__ == '__main__':
         save_bbox=save_bbox,
         save_labels=save_labels,
         image_directory=image_directory,
-        sam_model=sam_model
+        sam_model=sam_model,
     )
     main.show()
     sys.exit(app.exec_())

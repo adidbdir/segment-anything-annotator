@@ -38,6 +38,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -46,6 +47,12 @@ import torch
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
+from matsam_client import (
+    MatSamClientError,
+    MatSamProtocolError,
+    MatSamWorkerClient,
+    matsam_interpreter_exists,
+)
 from micro_sam_client import (
     MicroSamClientError,
     MicroSamProtocolError,
@@ -60,6 +67,11 @@ DEFAULT_EMBEDDING_CACHE_SIZE = 1
 HASH_DIGEST_SIZE = 32
 HASH_CHUNK_SIZE = 1 << 20  # 1 MiB
 PREPROCESSING_PIPELINE_VERSION = "transform_input_v1"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MATSAM_INTERACTIVE_UNSUPPORTED_MESSAGE = (
+    "MatSAMは自動分割専用です。ポイントプロンプトによる対話的セグメンテーションには"
+    "対応していません。SAM2またはmicro-samモデルを選択してください。"
+)
 
 # SAM2.1 model size -> (config file, checkpoint path), relative to the
 # annotator's working directory (unchanged from the previous inline dict in
@@ -135,6 +147,60 @@ MICRO_SAM_CHECKPOINT_SIZE_MB: dict[str, int] = {
     "vit_b_em_organelles": 360,
     "vit_l_em_organelles": 1200,
 }
+
+MATSAM_MODEL_NAMES: tuple[str, ...] = ("matsam:vit_b", "matsam:vit_h")
+
+
+@dataclass(frozen=True)
+class MatSamModelSpec:
+    """MatSAM model identity and local SAM-v1 checkpoint path."""
+
+    name: str
+    sam_variant: str
+    checkpoint_path: str
+
+
+MATSAM_MODEL_SPECS = {
+    "matsam:vit_b": MatSamModelSpec(
+        "matsam:vit_b",
+        "vit_b",
+        "external/matsam/checkpoints/sam_vit_b_01ec64.pth",
+    ),
+    "matsam:vit_h": MatSamModelSpec(
+        "matsam:vit_h",
+        "vit_h",
+        "external/matsam/checkpoints/sam_vit_h_4b8939.pth",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class MatSamParams:
+    """Automatic segmentation parameters matching MatSAM's notebook defaults."""
+
+    layers: int = 0
+    scales: int = 3
+    n_per_side_base: int = 32
+    method_type: int = 1
+    pred_iou_thresh: float = 0.90
+    stability_score_thresh: float = 0.92
+    box_nms_thresh: float = 0.80
+    min_mask_region_area: int = 0
+    max_image_size: int = 1024
+
+    def to_worker_params(self) -> dict[str, object]:
+        """Return the exact parameter schema accepted by the MatSAM worker."""
+        return {
+            "layers": self.layers,
+            "scales": self.scales,
+            "n_per_side_base": self.n_per_side_base,
+            "method_type": self.method_type,
+            "pred_iou_thresh": self.pred_iou_thresh,
+            "stability_score_thresh": self.stability_score_thresh,
+            "box_nms_thresh": self.box_nms_thresh,
+            "min_mask_region_area": self.min_mask_region_area,
+            "max_image_size": self.max_image_size,
+        }
 
 
 @dataclass(frozen=True)
@@ -321,7 +387,7 @@ class SegmenterAdapter(ABC):
         image_np: np.ndarray,
         image_key: ImageKey,
         *,
-        params: "AmgParams | MicroSamParams | None" = None,
+        params: "AmgParams | MicroSamParams | MatSamParams | None" = None,
     ) -> AutoSegmentationResult:
         """Generate automatic masks when the backend supports AMG.
 
@@ -429,7 +495,7 @@ class Sam2Adapter(SegmenterAdapter):
         image_np: np.ndarray,
         image_key: ImageKey,
         *,
-        params: "AmgParams | MicroSamParams | None" = None,
+        params: "AmgParams | MicroSamParams | MatSamParams | None" = None,
     ) -> AutoSegmentationResult:
         """Run SAM2 AMG with the already-loaded model instance.
 
@@ -579,9 +645,8 @@ class MicroSamAdapter(SegmenterAdapter):
         try:
             probe_metadata = client.probe(self.name)
             cached = probe_metadata.get("cached")
-            if (
-                probe_metadata.get("model_type") != self.name
-                or not isinstance(cached, bool)
+            if probe_metadata.get("model_type") != self.name or not isinstance(
+                cached, bool
             ):
                 raise MicroSamProtocolError(
                     "probe",
@@ -604,7 +669,9 @@ class MicroSamAdapter(SegmenterAdapter):
                 metadata.get("model_type") != self.name
                 or not isinstance(checkpoint_hash, str)
                 or len(checkpoint_hash) != 64
-                or any(character not in "0123456789abcdef" for character in checkpoint_hash)
+                or any(
+                    character not in "0123456789abcdef" for character in checkpoint_hash
+                )
                 or supported_modes != list(self._supported_auto_modes)
             ):
                 raise MicroSamProtocolError(
@@ -658,7 +725,7 @@ class MicroSamAdapter(SegmenterAdapter):
         image_np: np.ndarray,
         image_key: ImageKey,
         *,
-        params: "AmgParams | MicroSamParams | None" = None,
+        params: "AmgParams | MicroSamParams | MatSamParams | None" = None,
     ) -> AutoSegmentationResult:
         """Generate polygon-only automatic masks through the worker."""
         if params is not None and not isinstance(params, MicroSamParams):
@@ -753,9 +820,7 @@ class MicroSamAdapter(SegmenterAdapter):
                 auto_masks.append(
                     AutoMask(
                         segmentation=None,
-                        score=(
-                            float(score_value) if score_value is not None else None
-                        ),
+                        score=(float(score_value) if score_value is not None else None),
                         area=int(area_value),
                         points=points,
                     )
@@ -763,6 +828,231 @@ class MicroSamAdapter(SegmenterAdapter):
         except (TypeError, ValueError) as exc:
             client.terminate()
             raise MicroSamProtocolError(
+                "generate_auto",
+                "invalid_result",
+                str(exc),
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            ) from exc
+        return auto_masks
+
+
+class MatSamAdapter(SegmenterAdapter):
+    """Segmenter adapter backed by a persistent isolated MatSAM worker."""
+
+    def __init__(self, model_name: str, *, device: str = "auto") -> None:
+        if model_name not in MATSAM_MODEL_SPECS:
+            raise ValueError(f"Unsupported MatSAM model: {model_name}")
+        self._model_spec = MATSAM_MODEL_SPECS[model_name]
+        self._device = device
+        self._checkpoint_hash: str | None = None
+        self._client: MatSamWorkerClient | None = None
+
+    @property
+    def name(self) -> str:
+        return self._model_spec.name
+
+    @property
+    def checkpoint_hash(self) -> str | None:
+        return self._checkpoint_hash
+
+    def load(self, *, client: MatSamWorkerClient | None = None) -> None:
+        if not matsam_interpreter_exists():
+            raise NotInstalledError(
+                "MatSAM がインストールされていません。"
+                "分離環境 envs/matsam が必要です。"
+                "SAM2またはmicro-samモデルを選択してください。"
+            )
+        checkpoint_path = self._resolve_checkpoint_path()
+        if not checkpoint_path.is_file():
+            raise NotInstalledError(
+                f"MatSAMチェックポイントが見つかりません: {checkpoint_path}。"
+                "チェックポイントを配置するか、別のSAMモデルを選択してください。"
+            )
+        if self._client is not None:
+            return
+        if client is None:
+            client = MatSamWorkerClient()
+        try:
+            checkpoint_path_text = str(checkpoint_path)
+            probe_metadata = client.probe(
+                self._model_spec.sam_variant,
+                checkpoint_path_text,
+            )
+            if probe_metadata != {
+                "sam_variant": self._model_spec.sam_variant,
+                "checkpoint_path": checkpoint_path_text,
+                "cached": True,
+            }:
+                raise MatSamProtocolError(
+                    "probe",
+                    "invalid_result",
+                    "worker checkpoint metadata did not match the requested model",
+                    stderr_tail=client.stderr_tail,
+                    fatal=True,
+                )
+            checkpoint_hash = hash_file_bytes(checkpoint_path_text)
+            metadata = client.init(
+                self._model_spec.sam_variant,
+                checkpoint_path_text,
+                self._device,
+            )
+            identity_hash = metadata.get("checkpoint_hash")
+            if (
+                set(metadata)
+                != {"sam_variant", "device", "checkpoint_path", "checkpoint_hash"}
+                or metadata.get("sam_variant") != self._model_spec.sam_variant
+                or metadata.get("checkpoint_path") != checkpoint_path_text
+                or not isinstance(metadata.get("device"), str)
+                or not isinstance(identity_hash, str)
+                or len(identity_hash) != 64
+                or any(
+                    character not in "0123456789abcdef" for character in identity_hash
+                )
+            ):
+                raise MatSamProtocolError(
+                    "init",
+                    "invalid_result",
+                    "worker metadata did not match the requested model",
+                    stderr_tail=client.stderr_tail,
+                    fatal=True,
+                )
+        except Exception:
+            client.terminate()
+            raise
+        self._client = client
+        self._checkpoint_hash = checkpoint_hash
+
+    def set_image(self, image_np: np.ndarray, image_key: ImageKey) -> None:
+        """Reject interactive embedding activation before a worker round-trip."""
+        raise NotImplementedError(MATSAM_INTERACTIVE_UNSUPPORTED_MESSAGE)
+
+    def predict(
+        self,
+        *,
+        point_coords: np.ndarray | None = None,
+        point_labels: np.ndarray | None = None,
+        box: np.ndarray | None = None,
+        multimask_output: bool = True,
+    ) -> PredictionResult:
+        """Reject point- and box-prompt prediction immediately."""
+        raise NotImplementedError(MATSAM_INTERACTIVE_UNSUPPORTED_MESSAGE)
+
+    def generate_auto(
+        self,
+        image_np: np.ndarray,
+        image_key: ImageKey,
+        *,
+        params: "AmgParams | MicroSamParams | MatSamParams | None" = None,
+    ) -> AutoSegmentationResult:
+        """Generate full-resolution polygon masks through the MatSAM worker."""
+        if params is not None and not isinstance(params, MatSamParams):
+            raise TypeError("MatSamAdapter requires MatSamParams")
+        resolved_params = params or MatSamParams()
+        client = self._require_client()
+        try:
+            result = client.generate_auto(
+                image_np,
+                image_key,
+                resolved_params.to_worker_params(),
+            )
+            return self._decode_auto_masks(result, client, image_np.shape[:2])
+        except MatSamClientError as exc:
+            self._handle_client_error(exc)
+
+    def unload(self) -> None:
+        client = self._client
+        self._client = None
+        self._checkpoint_hash = None
+        if client is None:
+            return
+        try:
+            client.unload()
+            client.shutdown()
+        except MatSamClientError:
+            client.terminate()
+
+    def _resolve_checkpoint_path(self) -> Path:
+        checkpoint_path = Path(self._model_spec.checkpoint_path)
+        if checkpoint_path.is_absolute():
+            return checkpoint_path
+        return (REPO_ROOT / checkpoint_path).resolve()
+
+    def _require_client(self) -> MatSamWorkerClient:
+        if self._client is None or not self._client.is_alive:
+            self._client = None
+            self._checkpoint_hash = None
+            raise RuntimeError(
+                f"MatSAM worker ({self.name}) is not loaded; call load() first."
+            )
+        return self._client
+
+    def _handle_client_error(self, error: MatSamClientError) -> None:
+        if error.fatal:
+            client = self._client
+            self._client = None
+            self._checkpoint_hash = None
+            if client is not None:
+                client.terminate()
+        raise error
+
+    @staticmethod
+    def _decode_auto_masks(
+        result: dict[str, object],
+        client: MatSamWorkerClient,
+        expected_image_shape: tuple[int, int],
+    ) -> AutoSegmentationResult:
+        from auto_annotation.base import AutoMask
+
+        if (
+            set(result) != {"mode", "image_shape", "masks"}
+            or result.get("mode") != "matsam"
+            or result.get("image_shape") != list(expected_image_shape)
+        ):
+            client.terminate()
+            raise MatSamProtocolError(
+                "generate_auto",
+                "invalid_result",
+                "worker automatic result has an invalid schema",
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            )
+        records = result.get("masks")
+        if not isinstance(records, list):
+            client.terminate()
+            raise MatSamProtocolError(
+                "generate_auto",
+                "invalid_result",
+                "worker masks result must be a list",
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            )
+        auto_masks: list[AutoMask] = []
+        try:
+            for record in records:
+                if not isinstance(record, dict) or set(record) != {
+                    "points",
+                    "score",
+                    "area",
+                }:
+                    raise ValueError("invalid automatic mask record")
+                points_value = record["points"]
+                if not isinstance(points_value, list):
+                    raise ValueError("automatic mask points must be a list")
+                points = [[float(x), float(y)] for x, y in points_value]
+                score_value = record["score"]
+                area_value = record["area"]
+                auto_masks.append(
+                    AutoMask(
+                        segmentation=None,
+                        score=(float(score_value) if score_value is not None else None),
+                        area=int(area_value),
+                        points=points,
+                    )
+                )
+        except (TypeError, ValueError) as exc:
+            client.terminate()
+            raise MatSamProtocolError(
                 "generate_auto",
                 "invalid_result",
                 str(exc),
