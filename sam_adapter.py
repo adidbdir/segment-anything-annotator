@@ -47,6 +47,12 @@ import torch
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
+from cellpose_client import (
+    CellposeClientError,
+    CellposeProtocolError,
+    CellposeWorkerClient,
+    cellpose_interpreter_exists,
+)
 from matsam_client import (
     MatSamClientError,
     MatSamProtocolError,
@@ -70,6 +76,10 @@ PREPROCESSING_PIPELINE_VERSION = "transform_input_v1"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MATSAM_INTERACTIVE_UNSUPPORTED_MESSAGE = (
     "MatSAMは自動分割専用です。ポイントプロンプトによる対話的セグメンテーションには"
+    "対応していません。SAM2またはmicro-samモデルを選択してください。"
+)
+CELLPOSE_INTERACTIVE_UNSUPPORTED_MESSAGE = (
+    "Cellposeは自動分割専用です。ポイントプロンプトによる対話的セグメンテーションには"
     "対応していません。SAM2またはmicro-samモデルを選択してください。"
 )
 
@@ -173,6 +183,36 @@ MATSAM_MODEL_SPECS = {
     ),
 }
 
+CELLPOSE_MODEL_NAMES: tuple[str, ...] = (
+    "cellpose:cpsam_v2",
+    "cellpose:cpdino",
+    "cellpose:cpdino-vitb",
+)
+
+
+@dataclass(frozen=True)
+class CellposeModelSpec:
+    """Cellpose model identity and raw worker model name."""
+
+    name: str
+    cellpose_model_name: str
+
+
+CELLPOSE_MODEL_SPECS: dict[str, CellposeModelSpec] = {
+    "cellpose:cpsam_v2": CellposeModelSpec(
+        "cellpose:cpsam_v2",
+        "cpsam_v2",
+    ),
+    "cellpose:cpdino": CellposeModelSpec(
+        "cellpose:cpdino",
+        "cpdino",
+    ),
+    "cellpose:cpdino-vitb": CellposeModelSpec(
+        "cellpose:cpdino-vitb",
+        "cpdino-vitb",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class MatSamParams:
@@ -198,6 +238,27 @@ class MatSamParams:
             "pred_iou_thresh": self.pred_iou_thresh,
             "stability_score_thresh": self.stability_score_thresh,
             "box_nms_thresh": self.box_nms_thresh,
+            "min_mask_region_area": self.min_mask_region_area,
+            "max_image_size": self.max_image_size,
+        }
+
+
+@dataclass(frozen=True)
+class CellposeParams:
+    """Automatic segmentation parameters for Cellpose."""
+
+    diameter: float | None = None
+    flow_threshold: float = 0.4
+    cellprob_threshold: float = 0.0
+    min_mask_region_area: int = 0
+    max_image_size: int = 1024
+
+    def to_worker_params(self) -> dict[str, object]:
+        """Return the exact parameter schema accepted by the Cellpose worker."""
+        return {
+            "diameter": self.diameter,
+            "flow_threshold": self.flow_threshold,
+            "cellprob_threshold": self.cellprob_threshold,
             "min_mask_region_area": self.min_mask_region_area,
             "max_image_size": self.max_image_size,
         }
@@ -387,7 +448,7 @@ class SegmenterAdapter(ABC):
         image_np: np.ndarray,
         image_key: ImageKey,
         *,
-        params: "AmgParams | MicroSamParams | MatSamParams | None" = None,
+        params: "AmgParams | MicroSamParams | MatSamParams | CellposeParams | None" = None,
     ) -> AutoSegmentationResult:
         """Generate automatic masks when the backend supports AMG.
 
@@ -1053,6 +1114,220 @@ class MatSamAdapter(SegmenterAdapter):
         except (TypeError, ValueError) as exc:
             client.terminate()
             raise MatSamProtocolError(
+                "generate_auto",
+                "invalid_result",
+                str(exc),
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            ) from exc
+        return auto_masks
+
+
+class CellposeAdapter(SegmenterAdapter):
+    """Segmenter adapter backed by a persistent isolated Cellpose worker."""
+
+    def __init__(self, model_name: str, *, device: str = "auto") -> None:
+        if model_name not in CELLPOSE_MODEL_NAMES:
+            raise ValueError(f"Unsupported Cellpose model: {model_name}")
+        self._model_spec = CELLPOSE_MODEL_SPECS[model_name]
+        self._device = device
+        self._checkpoint_hash: str | None = None
+        self._client: CellposeWorkerClient | None = None
+
+    @property
+    def name(self) -> str:
+        return self._model_spec.name
+
+    @property
+    def checkpoint_hash(self) -> str | None:
+        return self._checkpoint_hash
+
+    def load(self, *, client: CellposeWorkerClient | None = None) -> None:
+        if not cellpose_interpreter_exists():
+            raise NotInstalledError(
+                "Cellpose がインストールされていません。"
+                "分離環境 envs/cellpose が必要です。"
+                "SAM2またはmicro-sam、MatSAMモデルを選択してください。"
+            )
+        if self._client is not None:
+            return
+        if client is None:
+            client = CellposeWorkerClient()
+        raw_model_name = self._model_spec.cellpose_model_name
+        try:
+            probe_metadata = client.probe(raw_model_name)
+            cached = probe_metadata.get("cached")
+            if (
+                set(probe_metadata) != {"model_name", "cached"}
+                or probe_metadata.get("model_name") != raw_model_name
+                or not isinstance(cached, bool)
+            ):
+                raise CellposeProtocolError(
+                    "probe",
+                    "invalid_result",
+                    "worker dependency metadata did not match the requested model",
+                    stderr_tail=client.stderr_tail,
+                    fatal=True,
+                )
+            if not cached:
+                client.terminate()
+                raise NotInstalledError(
+                    f"{self.name} には dinov3 が必要ですが、Cellpose分離環境に"
+                    "インストールされていません。次のコマンドで導入してください: "
+                    "uv pip install --python envs/cellpose/bin/python "
+                    "git+https://github.com/facebookresearch/dinov3。"
+                    "代わりに cellpose:cpsam_v2 を選択できます。"
+                )
+            metadata = client.init(raw_model_name, self._device)
+            checkpoint_hash = metadata.get("checkpoint_hash")
+            if (
+                set(metadata) != {"model_name", "device", "checkpoint_hash"}
+                or metadata.get("model_name") != raw_model_name
+                or not isinstance(metadata.get("device"), str)
+                or not isinstance(checkpoint_hash, str)
+                or len(checkpoint_hash) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in checkpoint_hash
+                )
+            ):
+                raise CellposeProtocolError(
+                    "init",
+                    "invalid_result",
+                    "worker metadata did not match the requested model",
+                    stderr_tail=client.stderr_tail,
+                    fatal=True,
+                )
+        except Exception:
+            client.terminate()
+            raise
+        self._client = client
+        self._checkpoint_hash = checkpoint_hash
+
+    def set_image(self, image_np: np.ndarray, image_key: ImageKey) -> None:
+        """Reject interactive embedding activation before a worker round-trip."""
+        raise NotImplementedError(CELLPOSE_INTERACTIVE_UNSUPPORTED_MESSAGE)
+
+    def predict(
+        self,
+        *,
+        point_coords: np.ndarray | None = None,
+        point_labels: np.ndarray | None = None,
+        box: np.ndarray | None = None,
+        multimask_output: bool = True,
+    ) -> PredictionResult:
+        """Reject point- and box-prompt prediction immediately."""
+        raise NotImplementedError(CELLPOSE_INTERACTIVE_UNSUPPORTED_MESSAGE)
+
+    def generate_auto(
+        self,
+        image_np: np.ndarray,
+        image_key: ImageKey,
+        *,
+        params: "AmgParams | MicroSamParams | MatSamParams | CellposeParams | None" = None,
+    ) -> AutoSegmentationResult:
+        """Generate full-resolution polygon masks through the Cellpose worker."""
+        if params is not None and not isinstance(params, CellposeParams):
+            raise TypeError("CellposeAdapter requires CellposeParams")
+        resolved_params = params or CellposeParams()
+        client = self._require_client()
+        try:
+            result = client.generate_auto(
+                image_np,
+                image_key,
+                resolved_params.to_worker_params(),
+            )
+            return self._decode_auto_masks(result, client, image_np.shape[:2])
+        except CellposeClientError as exc:
+            self._handle_client_error(exc)
+
+    def unload(self) -> None:
+        client = self._client
+        self._client = None
+        self._checkpoint_hash = None
+        if client is None:
+            return
+        try:
+            client.unload()
+            client.shutdown()
+        except CellposeClientError:
+            client.terminate()
+
+    def _require_client(self) -> CellposeWorkerClient:
+        if self._client is None or not self._client.is_alive:
+            self._client = None
+            self._checkpoint_hash = None
+            raise RuntimeError(
+                f"Cellpose worker ({self.name}) is not loaded; call load() first."
+            )
+        return self._client
+
+    def _handle_client_error(self, error: CellposeClientError) -> None:
+        if error.fatal:
+            client = self._client
+            self._client = None
+            self._checkpoint_hash = None
+            if client is not None:
+                client.terminate()
+        raise error
+
+    @staticmethod
+    def _decode_auto_masks(
+        result: dict[str, object],
+        client: CellposeWorkerClient,
+        expected_image_shape: tuple[int, int],
+    ) -> AutoSegmentationResult:
+        from auto_annotation.base import AutoMask
+
+        if (
+            set(result) != {"mode", "image_shape", "masks"}
+            or result.get("mode") != "cellpose"
+            or result.get("image_shape") != list(expected_image_shape)
+        ):
+            client.terminate()
+            raise CellposeProtocolError(
+                "generate_auto",
+                "invalid_result",
+                "worker automatic result has an invalid schema",
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            )
+        records = result.get("masks")
+        if not isinstance(records, list):
+            client.terminate()
+            raise CellposeProtocolError(
+                "generate_auto",
+                "invalid_result",
+                "worker masks result must be a list",
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            )
+        auto_masks: list[AutoMask] = []
+        try:
+            for record in records:
+                if not isinstance(record, dict) or set(record) != {
+                    "points",
+                    "score",
+                    "area",
+                }:
+                    raise ValueError("invalid automatic mask record")
+                points_value = record["points"]
+                if not isinstance(points_value, list):
+                    raise ValueError("automatic mask points must be a list")
+                points = [[float(x), float(y)] for x, y in points_value]
+                score_value = record["score"]
+                area_value = record["area"]
+                auto_masks.append(
+                    AutoMask(
+                        segmentation=None,
+                        score=(float(score_value) if score_value is not None else None),
+                        area=int(area_value),
+                        points=points,
+                    )
+                )
+        except (TypeError, ValueError) as exc:
+            client.terminate()
+            raise CellposeProtocolError(
                 "generate_auto",
                 "invalid_result",
                 str(exc),

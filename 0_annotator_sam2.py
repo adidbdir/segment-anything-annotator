@@ -57,12 +57,15 @@ sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "external", "sam2"))
 )
 from sam_adapter import (  # noqa: E402
+    CELLPOSE_MODEL_NAMES,
     MATSAM_MODEL_NAMES,
     MATSAM_MODEL_SPECS,
     MICRO_SAM_CHECKPOINT_SIZE_MB,
     MICRO_SAM_MODEL_NAMES,
     MICRO_SAM_MODEL_SPECS,
     SAM2_MODEL_SPECS,
+    CellposeAdapter,
+    CellposeParams,
     ImageKey,
     MatSamAdapter,
     MatSamParams,
@@ -73,9 +76,11 @@ from sam_adapter import (  # noqa: E402
     Sam2Adapter,
     SegmenterAdapter,
     build_image_key,
+    cellpose_interpreter_exists,
     matsam_interpreter_exists,
     micro_sam_interpreter_exists,
 )
+from cellpose_client import CellposeClientError, CellposeWorkerClient  # noqa: E402
 from matsam_client import MatSamClientError, MatSamWorkerClient  # noqa: E402
 from micro_sam_client import MicroSamClientError, MicroSamWorkerClient  # noqa: E402
 import csv_exporter  # noqa: E402
@@ -106,6 +111,15 @@ AUTO_SEG_MAX_SCALES = 10
 AUTO_SEG_MAX_IMAGE_SIZE = 32768
 MATSAM_METHOD_TYPE_MIN = 1
 MATSAM_METHOD_TYPE_MAX = 2
+CELLPOSE_DIAMETER_MIN = 0.0
+CELLPOSE_DIAMETER_MAX = 10000.0
+CELLPOSE_DEFAULT_MANUAL_DIAMETER = 30.0
+CELLPOSE_FLOW_THRESHOLD_MIN = 0.0
+CELLPOSE_FLOW_THRESHOLD_MAX = 100.0
+CELLPOSE_CELLPROB_THRESHOLD_MIN = -6.0
+CELLPOSE_CELLPROB_THRESHOLD_MAX = 6.0
+CELLPOSE_PARAMETER_DECIMALS = 2
+CELLPOSE_PARAMETER_STEP = 0.1
 MIN_AUTO_SEG_POLYGON_POINTS = 3
 
 
@@ -123,12 +137,14 @@ class _SamLoadWorker(QObject):
         old_segmenter: SegmenterAdapter | None,
         micro_sam_client: MicroSamWorkerClient | None = None,
         matsam_client: MatSamWorkerClient | None = None,
+        cellpose_client: CellposeWorkerClient | None = None,
     ) -> None:
         super().__init__()
         self.new_segmenter = new_segmenter
         self.old_segmenter = old_segmenter
         self.micro_sam_client = micro_sam_client
         self.matsam_client = matsam_client
+        self.cellpose_client = cellpose_client
         self._cancel_requested = threading.Event()
         self._result_decided = threading.Event()
         self._decision_lock = threading.Lock()
@@ -163,6 +179,8 @@ class _SamLoadWorker(QObject):
                 )
             elif isinstance(self.new_segmenter, MatSamAdapter):
                 self.new_segmenter.load(client=self.matsam_client)
+            elif isinstance(self.new_segmenter, CellposeAdapter):
+                self.new_segmenter.load(client=self.cellpose_client)
             else:
                 self.new_segmenter.load()
             if self._cancel_requested.is_set():
@@ -197,6 +215,8 @@ class _SamLoadWorker(QObject):
             pass
         if self.matsam_client is not None and self.matsam_client.is_alive:
             self.matsam_client.terminate()
+        if self.cellpose_client is not None and self.cellpose_client.is_alive:
+            self.cellpose_client.terminate()
 
 
 class MainWindow(QMainWindow):
@@ -1646,6 +1666,7 @@ class MainWindow(QMainWindow):
         switches). micro-sam entries are available only when the isolated
         interpreter exists under ``envs/micro_sam``. MatSAM entries require
         both their isolated interpreter and their model-specific checkpoint.
+        Cellpose entries require only their isolated interpreter.
         """
         self.samModelMenu = QtWidgets.QMenu(self.tr("SAM Model"), self)
         self.samModelActionGroup = QtWidgets.QActionGroup(self)
@@ -1710,6 +1731,27 @@ class MainWindow(QMainWindow):
             matSamMenu.addAction(matsam_act)
             self.samModelActions[name] = matsam_act
 
+        cellposeMenu = self.samModelMenu.addMenu(self.tr("Cellpose"))
+        cellpose_tip = self.tr(
+            "未導入(別環境/Phase 5): Cellpose は別環境へのインストールが必要です"
+        )
+        cellpose_available = cellpose_interpreter_exists()
+        for name in CELLPOSE_MODEL_NAMES:
+            label = name if cellpose_available else f"{name} (未導入/Phase 5)"
+            cellpose_act = QtWidgets.QAction(self.tr(label), self, checkable=True)
+            cellpose_act.setChecked(name == self.sam_model)
+            cellpose_act.setEnabled(cellpose_available)
+            if cellpose_available:
+                cellpose_act.triggered.connect(
+                    functools.partial(self.clickLoadSAM, name)
+                )
+            else:
+                cellpose_act.setToolTip(cellpose_tip)
+                cellpose_act.setStatusTip(cellpose_tip)
+            self.samModelActionGroup.addAction(cellpose_act)
+            cellposeMenu.addAction(cellpose_act)
+            self.samModelActions[name] = cellpose_act
+
         self.samModelMenuAction = self.samModelMenu.menuAction()
         self.samModelMenuAction.setText(self.tr("SAM Model"))
         self.samModelMenuAction.setToolTip(self.tr("使用するSAMモデルを選択"))
@@ -1727,7 +1769,10 @@ class MainWindow(QMainWindow):
             return
         target_model = model_name or getattr(self, "sam_model", "large")
         all_model_names = (
-            set(SAM2_MODEL_SPECS) | set(MICRO_SAM_MODEL_NAMES) | set(MATSAM_MODEL_NAMES)
+            set(SAM2_MODEL_SPECS)
+            | set(MICRO_SAM_MODEL_NAMES)
+            | set(MATSAM_MODEL_NAMES)
+            | set(CELLPOSE_MODEL_NAMES)
         )
         if target_model not in all_model_names:
             self.actions.autoSeg.setEnabled(False)
@@ -1739,8 +1784,10 @@ class MainWindow(QMainWindow):
         old_segmenter = self.segmenter
         is_micro_sam_target = target_model in MICRO_SAM_MODEL_SPECS
         is_matsam_target = target_model in MATSAM_MODEL_SPECS
+        is_cellpose_target = target_model in CELLPOSE_MODEL_NAMES
         micro_sam_client: MicroSamWorkerClient | None = None
         matsam_client: MatSamWorkerClient | None = None
+        cellpose_client: CellposeWorkerClient | None = None
         if is_micro_sam_target:
             print(f"micro-samモデルを読み込みます: {target_model}")
             new_segmenter: SegmenterAdapter = MicroSamAdapter(target_model)
@@ -1799,6 +1846,33 @@ class MainWindow(QMainWindow):
                 )
                 self._restoreSamLoadUi()
                 return
+        elif is_cellpose_target:
+            print(f"Cellposeモデルを読み込みます: {target_model}")
+            new_segmenter = CellposeAdapter(target_model)
+            old_segmenter_to_unload = None
+            try:
+                if not cellpose_interpreter_exists():
+                    raise NotInstalledError(
+                        "Cellpose がインストールされていません。"
+                        "分離環境 envs/cellpose が必要です。"
+                        "SAM2またはmicro-sam、MatSAMモデルを選択してください。"
+                    )
+                # Construct Popen on the long-lived GUI thread so
+                # PR_SET_PDEATHSIG tracks the GUI process. Only blocking
+                # probe/init work is delegated to _SamLoadWorker.
+                cellpose_client = CellposeWorkerClient()
+            except (NotInstalledError, NotImplementedError) as e:
+                QMessageBox.warning(self, "警告", str(e))
+                self._restoreSamLoadUi()
+                return
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "エラー",
+                    f"SAMモデルの読み込みに失敗しました: {e}",
+                )
+                self._restoreSamLoadUi()
+                return
         else:
             print(
                 f"SAM2モデルを読み込みます: {target_model} "
@@ -1824,6 +1898,7 @@ class MainWindow(QMainWindow):
             old_segmenter_to_unload,
             micro_sam_client,
             matsam_client,
+            cellpose_client,
         )
         worker.moveToThread(thread)
         self._samLoadThread = thread
@@ -1836,6 +1911,11 @@ class MainWindow(QMainWindow):
         if is_matsam_target:
             progress_dialog.setLabelText(
                 "MatSAMモデルを準備中… 大きなチェックポイントの読み込みに"
+                "時間がかかることがあります"
+            )
+        elif is_cellpose_target:
+            progress_dialog.setLabelText(
+                "Cellposeモデルを準備中… 初回は学習済み重みのダウンロードのため"
                 "時間がかかることがあります"
             )
         else:
@@ -1910,14 +1990,16 @@ class MainWindow(QMainWindow):
         if loaded_segmenter is None:
             self._restoreSamLoadUi()
             return
-        if (is_micro_sam_target or is_matsam_target) and old_segmenter is not None:
+        if (
+            is_micro_sam_target or is_matsam_target or is_cellpose_target
+        ) and old_segmenter is not None:
             old_segmenter.unload()
         self.segmenter = loaded_segmenter
         self.sam_model = target_model
         self._syncSamModelMenuChecked()
         self.actions.autoSeg.setEnabled(True)
         self.actions.promptSeg.setEnabled(
-            not isinstance(loaded_segmenter, MatSamAdapter)
+            not isinstance(loaded_segmenter, (MatSamAdapter, CellposeAdapter))
         )
         self._setSamModelMenuEnabled(True)
 
@@ -2006,7 +2088,8 @@ class MainWindow(QMainWindow):
         enabled = self.segmenter is not None
         self.actions.autoSeg.setEnabled(enabled)
         self.actions.promptSeg.setEnabled(
-            enabled and not isinstance(self.segmenter, MatSamAdapter)
+            enabled
+            and not isinstance(self.segmenter, (MatSamAdapter, CellposeAdapter))
         )
         self._setSamModelMenuEnabled(True)
 
@@ -2054,6 +2137,23 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.critical(self, "エラー", f"MatSAM 推論に失敗しました: {error}")
 
+    def _handleCellposeClientError(self, error: CellposeClientError) -> None:
+        """Reset GUI backend state after a Cellpose client failure."""
+        if error.fatal:
+            old_segmenter = self.segmenter
+            self.segmenter = None
+            if old_segmenter is not None:
+                old_segmenter.unload()
+            self.actions.autoSeg.setEnabled(False)
+            self.actions.promptSeg.setEnabled(False)
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"Cellpose ワーカーが停止しました。モデルを再読込してください: {error}",
+            )
+            return
+        QMessageBox.critical(self, "エラー", f"Cellpose 推論に失敗しました: {error}")
+
     def clickAutoSeg(self) -> None:
         """Generate editable primary polygons with SAM2 AMG."""
         if self.segmenter is None:
@@ -2076,6 +2176,9 @@ class MainWindow(QMainWindow):
         except MatSamClientError as exc:
             self._handleMatSamClientError(exc)
             return
+        except CellposeClientError as exc:
+            self._handleCellposeClientError(exc)
+            return
         except Exception as exc:
             QMessageBox.critical(
                 self,
@@ -2095,8 +2198,10 @@ class MainWindow(QMainWindow):
 
     def _showAutoSegParamsDialog(
         self,
-    ) -> AmgParams | MicroSamParams | MatSamParams | None:
+    ) -> AmgParams | MicroSamParams | MatSamParams | CellposeParams | None:
         """Dispatch to the active backend's automatic parameter dialog."""
+        if isinstance(self.segmenter, CellposeAdapter):
+            return self._showCellposeAutoSegParamsDialog()
         if isinstance(self.segmenter, MatSamAdapter):
             return self._showMatSamAutoSegParamsDialog()
         if isinstance(self.segmenter, MicroSamAdapter):
@@ -2395,6 +2500,106 @@ class MainWindow(QMainWindow):
             max_image_size=max_image_size.value(),
         )
 
+    def _showCellposeAutoSegParamsDialog(self) -> CellposeParams | None:
+        """Show Cellpose automatic segmentation parameter controls."""
+        defaults = CellposeParams()
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Cellpose 自動セグメンテーション設定")
+        form_layout = QtWidgets.QFormLayout(dialog)
+
+        diameter = self._createAutoSegSignedSpinBox(
+            dialog,
+            defaults.diameter or CELLPOSE_DEFAULT_MANUAL_DIAMETER,
+            CELLPOSE_DIAMETER_MIN,
+            CELLPOSE_DIAMETER_MAX,
+        )
+        auto_diameter = QtWidgets.QCheckBox("自動推定", dialog)
+        auto_diameter.setChecked(defaults.diameter is None)
+        diameter.setEnabled(not auto_diameter.isChecked())
+        auto_diameter.toggled.connect(
+            lambda checked: diameter.setEnabled(not checked)
+        )
+        diameter_layout = QtWidgets.QHBoxLayout()
+        diameter_layout.addWidget(diameter)
+        diameter_layout.addWidget(auto_diameter)
+        form_layout.addRow("直径", diameter_layout)
+
+        flow_threshold = self._createAutoSegSignedSpinBox(
+            dialog,
+            defaults.flow_threshold,
+            CELLPOSE_FLOW_THRESHOLD_MIN,
+            CELLPOSE_FLOW_THRESHOLD_MAX,
+        )
+        form_layout.addRow("フローしきい値", flow_threshold)
+
+        cellprob_threshold = self._createAutoSegSignedSpinBox(
+            dialog,
+            defaults.cellprob_threshold,
+            CELLPOSE_CELLPROB_THRESHOLD_MIN,
+            CELLPOSE_CELLPROB_THRESHOLD_MAX,
+        )
+        form_layout.addRow("細胞確率しきい値", cellprob_threshold)
+
+        min_mask_region_area = QtWidgets.QSpinBox(dialog)
+        min_mask_region_area.setRange(
+            AUTO_SEG_MIN_REGION_AREA,
+            AUTO_SEG_MAX_REGION_AREA,
+        )
+        min_mask_region_area.setValue(defaults.min_mask_region_area)
+        form_layout.addRow("最小マスク面積", min_mask_region_area)
+
+        max_image_size = QtWidgets.QSpinBox(dialog)
+        max_image_size.setRange(1, AUTO_SEG_MAX_IMAGE_SIZE)
+        max_image_size.setValue(defaults.max_image_size)
+        form_layout.addRow("内部処理の最大画像辺", max_image_size)
+
+        license_notice = QtWidgets.QLabel(
+            "Cellposeの学習済み重みは CC-BY-NC (非商用利用限定) です。"
+            "研究目的での利用が承認されています。",
+            dialog,
+        )
+        license_notice.setWordWrap(True)
+        license_notice.setStyleSheet("color: #666; font-size: 10px;")
+        form_layout.addRow(license_notice)
+
+        buttons = QtWidgets.QDialogButtonBox(dialog)
+        run_button = buttons.addButton(
+            "自動実行",
+            QtWidgets.QDialogButtonBox.AcceptRole,
+        )
+        cancel_button = buttons.addButton(
+            "キャンセル",
+            QtWidgets.QDialogButtonBox.RejectRole,
+        )
+        run_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        form_layout.addRow(buttons)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+        return CellposeParams(
+            diameter=None if auto_diameter.isChecked() else diameter.value(),
+            flow_threshold=flow_threshold.value(),
+            cellprob_threshold=cellprob_threshold.value(),
+            min_mask_region_area=min_mask_region_area.value(),
+            max_image_size=max_image_size.value(),
+        )
+
+    def _createAutoSegSignedSpinBox(
+        self,
+        parent: QtWidgets.QWidget,
+        value: float,
+        minimum: float,
+        maximum: float,
+    ) -> QtWidgets.QDoubleSpinBox:
+        """Create a Cellpose floating-point parameter control."""
+        spin_box = QtWidgets.QDoubleSpinBox(parent)
+        spin_box.setRange(minimum, maximum)
+        spin_box.setDecimals(CELLPOSE_PARAMETER_DECIMALS)
+        spin_box.setSingleStep(CELLPOSE_PARAMETER_STEP)
+        spin_box.setValue(value)
+        return spin_box
+
     def _createAutoSegThresholdSpinBox(
         self,
         parent: QtWidgets.QWidget,
@@ -2423,7 +2628,7 @@ class MainWindow(QMainWindow):
 
     def _runAutoSegOnCurrentImage(
         self,
-        params: AmgParams | MicroSamParams | MatSamParams,
+        params: AmgParams | MicroSamParams | MatSamParams | CellposeParams,
     ) -> list[Shape]:
         """Generate, register, and display primary polygons for the open image."""
         if self.segmenter is None:
@@ -2618,11 +2823,11 @@ class MainWindow(QMainWindow):
         """Run one prompt RPC and recover the GUI from fatal worker errors."""
         if self.segmenter is None:
             return None
-        if isinstance(self.segmenter, MatSamAdapter):
+        if isinstance(self.segmenter, (MatSamAdapter, CellposeAdapter)):
             QMessageBox.warning(
                 self,
                 "警告",
-                "MatSAMは自動分割専用です。ポイントまたはボックスプロンプトを"
+                "MatSAMとCellposeは自動分割専用です。ポイントまたはボックスプロンプトを"
                 "使用するにはSAM2またはmicro-samモデルを選択してください。",
             )
             return None
@@ -2639,6 +2844,9 @@ class MainWindow(QMainWindow):
             return None
         except MatSamClientError as exc:
             self._handleMatSamClientError(exc)
+            return None
+        except CellposeClientError as exc:
+            self._handleCellposeClientError(exc)
             return None
 
     def clickManualSegBBox(self):
@@ -3728,7 +3936,7 @@ class MainWindow(QMainWindow):
         secondary_best_mask = None
         if (
             self.segmenter is not None
-            and not isinstance(self.segmenter, MatSamAdapter)
+            and not isinstance(self.segmenter, (MatSamAdapter, CellposeAdapter))
             and self.current_img
         ):
             img = cv2.imread(self.current_img)[:, :, ::-1].copy()
@@ -4540,6 +4748,7 @@ def get_parser():
             *SAM2_MODEL_SPECS,
             *MICRO_SAM_MODEL_NAMES,
             *MATSAM_MODEL_NAMES,
+            *CELLPOSE_MODEL_NAMES,
         ],
         help="読み込むSAMモデル",
     )
