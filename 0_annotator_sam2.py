@@ -10,26 +10,21 @@ import json
 import math
 import time
 import argparse
+import threading
 import numpy as np
-import tempfile
-import base64
-import csv
-import uuid
 
-from PyQt5.QtWidgets import QWidget, QApplication, QMainWindow, QApplication, QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox, QScrollArea, QDockWidget, QMessageBox, QLineEdit, QCheckBox, QSpinBox, QDateEdit
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QFileDialog, QProgressBar, QScrollArea, QDockWidget, QMessageBox
 from PyQt5.QtGui import QPixmap, QIcon, QImage
 from PyQt5.Qt import QSize
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QEventLoop, QObject, QThread, Qt, Signal
 from qtpy import QtCore
 from qtpy import QtGui, QtWidgets
 from canvas import Canvas
 import utils
-from utils.download_model import download_model
 
-from labelme.widgets import ToolBar, UniqueLabelQListWidget, LabelDialog, LabelListWidget, LabelListWidgetItem, ZoomWidget
+from labelme.widgets import UniqueLabelQListWidget, LabelDialog, LabelListWidget, LabelListWidgetItem, ZoomWidget
 from labelme import PY2
 from labelme.label_file import LabelFile
-from labelme.label_file import LabelFileError
 
 
 from shape import Shape
@@ -42,23 +37,30 @@ Click = namedtuple('Click', ['is_positive', 'coords'])
 # from segment_anything import sam_model_registry, SamPredictor
 # sys.path.append('../sam2')
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'external', 'sam2')))
-from sam_adapter import (
+from sam_adapter import (  # noqa: E402
+    MICRO_SAM_CHECKPOINT_SIZE_MB,
     MICRO_SAM_MODEL_NAMES,
+    MICRO_SAM_MODEL_SPECS,
     SAM2_MODEL_SPECS,
+    ImageKey,
+    MicroSamAdapter,
+    MicroSamDownloadCancelledError,
+    MicroSamParams,
     NotInstalledError,
     Sam2Adapter,
     SegmenterAdapter,
     build_image_key,
+    micro_sam_interpreter_exists,
 )
-import csv_exporter
-from icecream import ic
+from micro_sam_client import MicroSamClientError, MicroSamWorkerClient  # noqa: E402
+import csv_exporter  # noqa: E402
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from auto_annotation import AmgParams
-from src.models.crystallization_analysis import CrystallizationAnalysis
+from auto_annotation import AmgParams  # noqa: E402
+from src.models.crystallization_analysis import CrystallizationAnalysis  # noqa: E402
 
 LABEL_COLORMAP = imgviz.label_colormap()
 
@@ -70,7 +72,96 @@ AUTO_SEG_THRESHOLD_MIN = 0.0
 AUTO_SEG_THRESHOLD_MAX = 1.0
 AUTO_SEG_THRESHOLD_DECIMALS = 2
 AUTO_SEG_THRESHOLD_STEP = 0.01
+AUTO_SEG_SMOOTHING_MAX = 100.0
+AUTO_SEG_SMOOTHING_DECIMALS = 2
+AUTO_SEG_SMOOTHING_STEP = 0.1
+AUTO_SEG_MAX_BATCH_SIZE = 1024
 MIN_AUTO_SEG_POLYGON_POINTS = 3
+
+
+class _SamLoadWorker(QObject):
+    """Load a segmenter without performing any GUI work in the thread."""
+
+    success = Signal(object, object)
+    failure = Signal(object, object)
+    download_confirmation = Signal(str, object)
+    finished = Signal()
+
+    def __init__(
+        self,
+        new_segmenter: SegmenterAdapter,
+        old_segmenter: SegmenterAdapter | None,
+        micro_sam_client: MicroSamWorkerClient | None = None,
+    ) -> None:
+        super().__init__()
+        self.new_segmenter = new_segmenter
+        self.old_segmenter = old_segmenter
+        self.micro_sam_client = micro_sam_client
+        self._cancel_requested = threading.Event()
+        self._result_decided = threading.Event()
+        self._decision_lock = threading.Lock()
+        self._result_accepted = False
+
+    def request_cancel(self) -> None:
+        """Request cancellation without waiting for a blocking model load."""
+        with self._decision_lock:
+            self._cancel_requested.set()
+            self._result_accepted = False
+            self._result_decided.set()
+
+    def accept_result(self) -> None:
+        """Allow the loaded adapter to be transferred to the main window."""
+        with self._decision_lock:
+            self._result_accepted = not self._cancel_requested.is_set()
+            self._result_decided.set()
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        """Unload in the required order, load, and report the result."""
+        try:
+            if self.old_segmenter is not None:
+                self.old_segmenter.unload()
+            if self._cancel_requested.is_set():
+                self._discard_new_segmenter()
+                return
+            if isinstance(self.new_segmenter, MicroSamAdapter):
+                self.new_segmenter.load(
+                    confirm_download=self._confirm_download,
+                    client=self.micro_sam_client,
+                )
+            else:
+                self.new_segmenter.load()
+            if self._cancel_requested.is_set():
+                self._discard_new_segmenter()
+                return
+            self.success.emit(self, self.new_segmenter)
+            self._result_decided.wait()
+            with self._decision_lock:
+                result_accepted = self._result_accepted
+            if not result_accepted:
+                self._discard_new_segmenter()
+        except Exception as exc:  # noqa: BLE001 - thread exception boundary
+            self._discard_new_segmenter()
+            self.failure.emit(self, exc)
+        finally:
+            self.finished.emit()
+
+    def _confirm_download(self, model_name: str) -> bool:
+        if self._cancel_requested.is_set():
+            return False
+        answer_holder: dict[str, bool] = {"proceed": False}
+        # BlockingQueuedConnection makes emit return only after the GUI-thread
+        # slot has shown the modal dialog and written the answer.
+        self.download_confirmation.emit(model_name, answer_holder)
+        return answer_holder["proceed"] and not self._cancel_requested.is_set()
+
+    def _discard_new_segmenter(self) -> None:
+        """Best-effort teardown for a failed or unwanted adapter."""
+        try:
+            self.new_segmenter.unload()
+        except Exception:  # noqa: BLE001 - teardown must not mask load failure
+            pass
+
 
 class MainWindow(QMainWindow):
 
@@ -127,6 +218,13 @@ class MainWindow(QMainWindow):
         # freshness (recompute vs. cache-hit) is fully delegated to the
         # adapter -- there is no more MainWindow-level "encoded" flag.
         self.segmenter: SegmenterAdapter | None = None
+        self._samLoadInFlight = False
+        self._samLoadCancelled = False
+        self._samLoadThread: QThread | None = None
+        self._samLoadWorker: _SamLoadWorker | None = None
+        self._samLoadLoop: QEventLoop | None = None
+        self._samLoadResult: SegmenterAdapter | None = None
+        self._samLoadError: Exception | None = None
 
         self.scroll_values = {
             Qt.Horizontal: {},
@@ -808,8 +906,6 @@ class MainWindow(QMainWindow):
         self.save_bbox = (state == Qt.Checked)
 
     def saveLabels(self, filename):
-        lf = LabelFile()
-
         def format_shape(s):
             data = s.other_data.copy()
             
@@ -861,7 +957,6 @@ class MainWindow(QMainWindow):
             return data
 
         shapes = [format_shape(item.shape()) for item in self.labelList]
-        imageData = base64.b64encode(self.current_img_data).decode("utf-8")
         save_data = {
             "version": "1.0.0",
             "flags": {},
@@ -927,7 +1022,7 @@ class MainWindow(QMainWindow):
             try:
                 ttt = int(label)
                 label = self.category_list[ttt]
-            except:
+            except Exception:
                 pass
 
             points = shape_data["points"]
@@ -1354,7 +1449,7 @@ class MainWindow(QMainWindow):
                 existing_date = QtCore.QDate.fromString(self.date_edit.text(), "yyMMdd")
                 if existing_date.isValid():
                     date_edit.setDate(existing_date)
-            except:
+            except Exception:
                 pass
         
         experimenter_edit = QtWidgets.QLineEdit(self.experimenter_edit.text())
@@ -1413,7 +1508,7 @@ class MainWindow(QMainWindow):
                     completion="contains",
                     fit_to_content={"column": True, "row": False},
                 )
-        except Exception as e:
+        except Exception:
             pass
 
     def _buildSamModelMenuAction(self):
@@ -1422,9 +1517,8 @@ class MainWindow(QMainWindow):
         Lists all SAM2 sizes (tiny/small/base_plus/large) as checkable,
         mutually exclusive entries that trigger clickLoadSAM(model_name) on
         selection (this both performs the initial load and runtime
-        switches). Also lists micro-sam entries, permanently disabled in
-        Phase 1 with a tooltip pointing to the future isolated-environment
-        install.
+        switches). micro-sam entries are available only when the isolated
+        interpreter exists under ``envs/micro_sam``.
         """
         self.samModelMenu = QtWidgets.QMenu(self.tr("SAM Model"), self)
         self.samModelActionGroup = QtWidgets.QActionGroup(self)
@@ -1442,64 +1536,268 @@ class MainWindow(QMainWindow):
         micro_sam_tip = self.tr(
             "未導入(別環境/Phase 3): micro-sam は別環境へのインストールが必要です"
         )
+        micro_sam_available = micro_sam_interpreter_exists()
         for name in MICRO_SAM_MODEL_NAMES:
-            micro_act = QtWidgets.QAction(self.tr(f"{name} (未導入/Phase 3)"), self)
-            micro_act.setEnabled(False)
-            micro_act.setToolTip(micro_sam_tip)
-            micro_act.setStatusTip(micro_sam_tip)
+            label = name if micro_sam_available else f"{name} (未導入/Phase 3)"
+            micro_act = QtWidgets.QAction(self.tr(label), self, checkable=True)
+            micro_act.setChecked(name == self.sam_model)
+            micro_act.setEnabled(micro_sam_available)
+            if micro_sam_available:
+                micro_act.triggered.connect(
+                    functools.partial(self.clickLoadSAM, name)
+                )
+            else:
+                micro_act.setToolTip(micro_sam_tip)
+                micro_act.setStatusTip(micro_sam_tip)
+            self.samModelActionGroup.addAction(micro_act)
             microSamMenu.addAction(micro_act)
+            self.samModelActions[name] = micro_act
 
         self.samModelMenuAction = self.samModelMenu.menuAction()
         self.samModelMenuAction.setText(self.tr("SAM Model"))
         self.samModelMenuAction.setToolTip(self.tr("使用するSAMモデルを選択"))
         return self.samModelMenuAction
 
-    def clickLoadSAM(self, model_name: str | None = None):
+    def clickLoadSAM(self, model_name: str | None = None) -> None:
         """Load the initial SAM model, or switch to a different one at runtime.
 
         Called with no argument for the initial load (uses self.sam_model,
         set from the --sam_model CLI arg). Called with an explicit
-        model_name from the SAM Model menu to switch models: the previous
-        adapter is unloaded (freeing GPU memory) before the new one is
-        loaded, so a stale embedding can never be reused across models.
+        model_name from the SAM Model menu. A local event loop preserves the
+        synchronous call contract while the model work runs on a QThread.
         """
+        if self._samLoadInFlight:
+            return
         target_model = model_name or getattr(self, "sam_model", "large")
-        if target_model not in SAM2_MODEL_SPECS:
+        all_model_names = set(SAM2_MODEL_SPECS) | set(MICRO_SAM_MODEL_NAMES)
+        if target_model not in all_model_names:
             self.actions.autoSeg.setEnabled(False)
             QMessageBox.warning(self, "警告", f"不明なSAMモデルです: {target_model}")
             return
         if self.segmenter is not None and self.segmenter.name == target_model:
             return  # already the active model; nothing to do
 
-        self._setSamModelMenuEnabled(False)
-        self.actions.autoSeg.setEnabled(False)
-        self.actions.promptSeg.setEnabled(False)
-        try:
-            if self.segmenter is not None:
-                self.segmenter.unload()
-                self.segmenter = None
+        old_segmenter = self.segmenter
+        is_micro_sam_target = target_model in MICRO_SAM_MODEL_SPECS
+        micro_sam_client: MicroSamWorkerClient | None = None
+        if is_micro_sam_target:
+            print(f"micro-samモデルを読み込みます: {target_model}")
+            new_segmenter: SegmenterAdapter = MicroSamAdapter(target_model)
+            old_segmenter_to_unload = None
+            try:
+                if not micro_sam_interpreter_exists():
+                    raise NotInstalledError(
+                        "micro-sam がインストールされていません。"
+                        "分離環境 envs/micro_sam が必要です。"
+                        "SAM2 モデルを選択してください。"
+                    )
+                micro_sam_client = MicroSamWorkerClient()
+            except (NotInstalledError, NotImplementedError) as e:
+                QMessageBox.warning(self, "警告", str(e))
+                self._restoreSamLoadUi()
+                return
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "エラー",
+                    f"SAMモデルの読み込みに失敗しました: {e}",
+                )
+                self._restoreSamLoadUi()
+                return
+        else:
             print(f"SAM2モデルを読み込みます: {target_model} "
                   f"({SAM2_MODEL_SPECS[target_model].checkpoint_path})")
             new_segmenter = Sam2Adapter(SAM2_MODEL_SPECS[target_model])
-            new_segmenter.load()
+            old_segmenter_to_unload = old_segmenter
+            # SAM2 must release the old model before loading the new one to
+            # avoid temporarily holding two models in GPU memory.
+            self.segmenter = None
+
+        self._samLoadInFlight = True
+        self._samLoadCancelled = False
+        self._samLoadResult = None
+        self._samLoadError = None
+        self._setSamModelMenuEnabled(False)
+        self.actions.autoSeg.setEnabled(False)
+        self.actions.promptSeg.setEnabled(False)
+
+        thread = QThread(self)
+        worker = _SamLoadWorker(
+            new_segmenter,
+            old_segmenter_to_unload,
+            micro_sam_client,
+        )
+        worker.moveToThread(thread)
+        self._samLoadThread = thread
+        self._samLoadWorker = worker
+
+        loop = QEventLoop(self)
+        self._samLoadLoop = loop
+        progress_dialog = QtWidgets.QProgressDialog(self)
+        progress_dialog.setWindowTitle("SAMモデル読込")
+        progress_dialog.setLabelText(
+            "SAMモデルを準備中… 初回はチェックポイントのダウンロードのため"
+            "数分かかることがあります"
+        )
+        progress_dialog.setCancelButtonText("キャンセル")
+        progress_dialog.setRange(0, 0)
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+
+        thread.started.connect(worker.run)
+        worker.success.connect(self._onSamLoadSuccess)
+        worker.failure.connect(self._onSamLoadFailure)
+        worker.download_confirmation.connect(
+            self._confirmMicroSamDownload,
+            type=Qt.BlockingQueuedConnection,
+        )
+        worker.finished.connect(thread.quit, type=Qt.DirectConnection)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._onSamLoadThreadFinished)
+        thread.finished.connect(thread.deleteLater)
+        progress_dialog.canceled.connect(self._cancelSamLoad)
+        application = QApplication.instance()
+        if application is not None:
+            application.aboutToQuit.connect(worker.request_cancel)
+
+        progress_dialog.show()
+        thread.start()
+        try:
+            loop.exec_()
+        finally:
+            self._samLoadLoop = None
+            progress_dialog.blockSignals(True)
+            progress_dialog.close()
+            progress_dialog.deleteLater()
+
+        if self._samLoadCancelled:
+            self._restoreSamLoadUi()
+            return
+
+        # A result signal means the worker has finished all blocking model
+        # work. Waiting here only completes QThread teardown and keeps the
+        # no-global-event-loop regression call contract deterministic.
+        thread.wait()
+        self._finalizeSamLoadThread(thread)
+
+        try:
+            if self._samLoadError is not None:
+                raise self._samLoadError
         except (NotInstalledError, NotImplementedError) as e:
             # Expected, user-facing conditions (e.g. micro-sam not installed).
             QMessageBox.warning(self, "警告", str(e))
-            self._setSamModelMenuEnabled(True)
+            self._restoreSamLoadUi()
+            return
+        except MicroSamDownloadCancelledError:
+            self._samLoadCancelled = True
+            self._restoreSamLoadUi()
             return
         except Exception as e:
             # Anything else (Hydra config errors, CUDA OOM, missing
             # checkpoint file, ...) still must not crash the GUI or leave
             # the toolbar stuck disabled.
             QMessageBox.critical(self, "エラー", f"SAMモデルの読み込みに失敗しました: {e}")
-            self._setSamModelMenuEnabled(True)
+            self._restoreSamLoadUi()
             return
 
-        self.segmenter = new_segmenter
+        loaded_segmenter = self._samLoadResult
+        if loaded_segmenter is None:
+            self._restoreSamLoadUi()
+            return
+        if is_micro_sam_target and old_segmenter is not None:
+            old_segmenter.unload()
+        self.segmenter = loaded_segmenter
         self.sam_model = target_model
         self._syncSamModelMenuChecked()
         self.actions.autoSeg.setEnabled(True)
         self.actions.promptSeg.setEnabled(True)
+        self._setSamModelMenuEnabled(True)
+
+    @QtCore.Slot(object, object)
+    def _onSamLoadSuccess(
+        self,
+        worker: object,
+        loaded_segmenter: object,
+    ) -> None:
+        """Accept only the active, non-cancelled load result."""
+        if not isinstance(worker, _SamLoadWorker) or not isinstance(
+            loaded_segmenter, SegmenterAdapter
+        ):
+            return
+        if (
+            worker is not self._samLoadWorker
+            or self._samLoadCancelled
+            or self._samLoadLoop is None
+        ):
+            worker.request_cancel()
+            return
+        self._samLoadResult = loaded_segmenter
+        worker.accept_result()
+        self._samLoadLoop.quit()
+
+    @QtCore.Slot(object, object)
+    def _onSamLoadFailure(self, worker: object, error: object) -> None:
+        """Store a worker exception for GUI-thread routing after the loop."""
+        if worker is not self._samLoadWorker or self._samLoadCancelled:
+            return
+        self._samLoadError = (
+            error if isinstance(error, Exception) else RuntimeError(str(error))
+        )
+        if self._samLoadLoop is not None:
+            self._samLoadLoop.quit()
+
+    @QtCore.Slot(str, object)
+    def _confirmMicroSamDownload(
+        self,
+        model_name: str,
+        answer_holder: object,
+    ) -> None:
+        """Ask for first-download consent on the GUI thread."""
+        if not isinstance(answer_holder, dict):
+            return
+        size_mb = MICRO_SAM_CHECKPOINT_SIZE_MB.get(model_name, "?")
+        answer = QMessageBox.question(
+            self,
+            "確認",
+            f"初回は約{size_mb}MBのダウンロードが必要です。続行しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        answer_holder["proceed"] = answer == QMessageBox.Yes
+
+    @QtCore.Slot()
+    def _cancelSamLoad(self) -> None:
+        """Stop waiting immediately and ask the worker to discard its result."""
+        if not self._samLoadInFlight or self._samLoadCancelled:
+            return
+        self._samLoadCancelled = True
+        worker = self._samLoadWorker
+        if worker is not None:
+            worker.request_cancel()
+        if self._samLoadLoop is not None:
+            self._samLoadLoop.quit()
+
+    @QtCore.Slot()
+    def _onSamLoadThreadFinished(self) -> None:
+        """Release retained QThread objects after a late cancellation finish."""
+        thread = self.sender()
+        if isinstance(thread, QThread):
+            self._finalizeSamLoadThread(thread)
+
+    def _finalizeSamLoadThread(self, thread: QThread) -> None:
+        """Clear load lifecycle state for the current worker thread."""
+        if thread is not self._samLoadThread:
+            return
+        self._samLoadThread = None
+        self._samLoadWorker = None
+        self._samLoadInFlight = False
+
+    def _restoreSamLoadUi(self) -> None:
+        """Restore menu checks and action availability after no model swap."""
+        self._syncSamModelMenuChecked()
+        enabled = self.segmenter is not None
+        self.actions.autoSeg.setEnabled(enabled)
+        self.actions.promptSeg.setEnabled(enabled)
         self._setSamModelMenuEnabled(True)
 
     def _setSamModelMenuEnabled(self, enabled: bool) -> None:
@@ -1511,6 +1809,23 @@ class MainWindow(QMainWindow):
         """Reflect the currently active model in the SAM Model menu's check state."""
         for name, action in getattr(self, "samModelActions", {}).items():
             action.setChecked(name == self.sam_model)
+
+    def _handleMicroSamClientError(self, error: MicroSamClientError) -> None:
+        """Reset GUI backend state after a micro-sam client failure."""
+        if error.fatal:
+            old_segmenter = self.segmenter
+            self.segmenter = None
+            if old_segmenter is not None:
+                old_segmenter.unload()
+            self.actions.autoSeg.setEnabled(False)
+            self.actions.promptSeg.setEnabled(False)
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"micro-sam ワーカーが停止しました。モデルを再読込してください: {error}",
+            )
+            return
+        QMessageBox.critical(self, "エラー", f"micro-sam 推論に失敗しました: {error}")
 
     def clickAutoSeg(self) -> None:
         """Generate editable primary polygons with SAM2 AMG."""
@@ -1528,6 +1843,9 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             new_shapes = self._runAutoSegOnCurrentImage(params)
+        except MicroSamClientError as exc:
+            self._handleMicroSamClientError(exc)
+            return
         except Exception as exc:
             QMessageBox.critical(
                 self,
@@ -1545,7 +1863,13 @@ class MainWindow(QMainWindow):
                 "条件に合うマスクは見つかりませんでした。",
             )
 
-    def _showAutoSegParamsDialog(self) -> AmgParams | None:
+    def _showAutoSegParamsDialog(self) -> AmgParams | MicroSamParams | None:
+        """Dispatch to the active backend's automatic parameter dialog."""
+        if isinstance(self.segmenter, MicroSamAdapter):
+            return self._showMicroSamAutoSegParamsDialog(self.segmenter)
+        return self._showSam2AutoSegParamsDialog()
+
+    def _showSam2AutoSegParamsDialog(self) -> AmgParams | None:
         """Show AMG parameter controls and return the accepted values."""
         defaults = AmgParams()
         dialog = QtWidgets.QDialog(self)
@@ -1609,6 +1933,145 @@ class MainWindow(QMainWindow):
             box_nms_thresh=box_nms_thresh.value(),
         )
 
+    def _showMicroSamAutoSegParamsDialog(
+        self,
+        adapter: MicroSamAdapter,
+    ) -> MicroSamParams | None:
+        """Show only controls relevant to the selected micro-sam mode."""
+        defaults = MicroSamParams(mode=adapter.default_auto_mode)
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("micro-sam 自動セグメンテーション設定")
+        form_layout = QtWidgets.QFormLayout(dialog)
+
+        mode_selector = QtWidgets.QComboBox(dialog)
+        for mode in adapter.supported_auto_modes:
+            mode_selector.addItem(mode.upper(), mode)
+        default_index = mode_selector.findData(adapter.default_auto_mode)
+        mode_selector.setCurrentIndex(max(default_index, 0))
+        form_layout.addRow("モード", mode_selector)
+
+        min_mask_region_area = QtWidgets.QSpinBox(dialog)
+        min_mask_region_area.setRange(
+            AUTO_SEG_MIN_REGION_AREA,
+            AUTO_SEG_MAX_REGION_AREA,
+        )
+        min_mask_region_area.setValue(defaults.min_mask_region_area)
+        form_layout.addRow("最小マスク面積", min_mask_region_area)
+
+        points_per_side = QtWidgets.QSpinBox(dialog)
+        points_per_side.setRange(
+            AUTO_SEG_MIN_POINTS_PER_SIDE,
+            AUTO_SEG_MAX_POINTS_PER_SIDE,
+        )
+        points_per_side.setValue(defaults.points_per_side)
+        form_layout.addRow("一辺あたりの点数", points_per_side)
+
+        pred_iou_thresh = self._createAutoSegThresholdSpinBox(
+            dialog, defaults.pred_iou_thresh
+        )
+        form_layout.addRow("IoU予測しきい値", pred_iou_thresh)
+        stability_score_thresh = self._createAutoSegThresholdSpinBox(
+            dialog, defaults.stability_score_thresh
+        )
+        form_layout.addRow("安定性スコアしきい値", stability_score_thresh)
+        box_nms_thresh = self._createAutoSegThresholdSpinBox(
+            dialog, defaults.box_nms_thresh
+        )
+        form_layout.addRow("Box NMSしきい値", box_nms_thresh)
+
+        center_distance_threshold = self._createAutoSegThresholdSpinBox(
+            dialog, defaults.center_distance_threshold
+        )
+        form_layout.addRow("中心距離しきい値", center_distance_threshold)
+        boundary_distance_threshold = self._createAutoSegThresholdSpinBox(
+            dialog, defaults.boundary_distance_threshold
+        )
+        form_layout.addRow("境界距離しきい値", boundary_distance_threshold)
+        foreground_threshold = self._createAutoSegThresholdSpinBox(
+            dialog, defaults.foreground_threshold
+        )
+        form_layout.addRow("前景しきい値", foreground_threshold)
+
+        foreground_smoothing = self._createAutoSegSmoothingSpinBox(
+            dialog, defaults.foreground_smoothing
+        )
+        form_layout.addRow("前景平滑化", foreground_smoothing)
+        distance_smoothing = self._createAutoSegSmoothingSpinBox(
+            dialog, defaults.distance_smoothing
+        )
+        form_layout.addRow("距離平滑化", distance_smoothing)
+
+        multimasking = QtWidgets.QCheckBox(dialog)
+        multimasking.setChecked(defaults.multimasking)
+        form_layout.addRow("マルチマスク", multimasking)
+        batch_size = QtWidgets.QSpinBox(dialog)
+        batch_size.setRange(1, AUTO_SEG_MAX_BATCH_SIZE)
+        batch_size.setValue(defaults.batch_size)
+        form_layout.addRow("バッチサイズ", batch_size)
+        nms_threshold = self._createAutoSegThresholdSpinBox(
+            dialog, defaults.nms_threshold
+        )
+        form_layout.addRow("NMSしきい値", nms_threshold)
+
+        mode_fields = {
+            points_per_side: {"amg"},
+            pred_iou_thresh: {"amg"},
+            stability_score_thresh: {"amg"},
+            box_nms_thresh: {"amg"},
+            center_distance_threshold: {"ais", "apg"},
+            boundary_distance_threshold: {"ais", "apg"},
+            foreground_threshold: {"ais", "apg"},
+            foreground_smoothing: {"ais"},
+            distance_smoothing: {"ais"},
+            multimasking: {"apg"},
+            batch_size: {"apg"},
+            nms_threshold: {"apg"},
+        }
+
+        def update_field_visibility() -> None:
+            selected_mode = mode_selector.currentData()
+            for field, modes in mode_fields.items():
+                visible = selected_mode in modes
+                field.setVisible(visible)
+                label = form_layout.labelForField(field)
+                if label is not None:
+                    label.setVisible(visible)
+
+        mode_selector.currentIndexChanged.connect(update_field_visibility)
+        update_field_visibility()
+
+        buttons = QtWidgets.QDialogButtonBox(dialog)
+        run_button = buttons.addButton(
+            "自動実行",
+            QtWidgets.QDialogButtonBox.AcceptRole,
+        )
+        cancel_button = buttons.addButton(
+            "キャンセル",
+            QtWidgets.QDialogButtonBox.RejectRole,
+        )
+        run_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        form_layout.addRow(buttons)
+
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+        return MicroSamParams(
+            mode=str(mode_selector.currentData()),
+            min_mask_region_area=min_mask_region_area.value(),
+            points_per_side=points_per_side.value(),
+            pred_iou_thresh=pred_iou_thresh.value(),
+            stability_score_thresh=stability_score_thresh.value(),
+            box_nms_thresh=box_nms_thresh.value(),
+            center_distance_threshold=center_distance_threshold.value(),
+            boundary_distance_threshold=boundary_distance_threshold.value(),
+            foreground_threshold=foreground_threshold.value(),
+            foreground_smoothing=foreground_smoothing.value(),
+            distance_smoothing=distance_smoothing.value(),
+            multimasking=multimasking.isChecked(),
+            batch_size=batch_size.value(),
+            nms_threshold=nms_threshold.value(),
+        )
+
     def _createAutoSegThresholdSpinBox(
         self,
         parent: QtWidgets.QWidget,
@@ -1622,7 +2085,23 @@ class MainWindow(QMainWindow):
         spin_box.setValue(value)
         return spin_box
 
-    def _runAutoSegOnCurrentImage(self, params: AmgParams) -> list[Shape]:
+    def _createAutoSegSmoothingSpinBox(
+        self,
+        parent: QtWidgets.QWidget,
+        value: float,
+    ) -> QtWidgets.QDoubleSpinBox:
+        """Create a non-negative smoothing parameter control."""
+        spin_box = QtWidgets.QDoubleSpinBox(parent)
+        spin_box.setRange(0.0, AUTO_SEG_SMOOTHING_MAX)
+        spin_box.setDecimals(AUTO_SEG_SMOOTHING_DECIMALS)
+        spin_box.setSingleStep(AUTO_SEG_SMOOTHING_STEP)
+        spin_box.setValue(value)
+        return spin_box
+
+    def _runAutoSegOnCurrentImage(
+        self,
+        params: AmgParams | MicroSamParams,
+    ) -> list[Shape]:
         """Generate, register, and display primary polygons for the open image."""
         if self.segmenter is None:
             raise RuntimeError("SAMモデルが読み込まれていません。")
@@ -1687,7 +2166,7 @@ class MainWindow(QMainWindow):
     def getMaxId(self):
         max_id = -1
         for label in self.labelList:
-            if label.shape().group_id != None:
+            if label.shape().group_id is not None:
                 max_id = max(max_id, int(label.shape().group_id))
         return max_id
         
@@ -1732,7 +2211,8 @@ class MainWindow(QMainWindow):
 
                 # Resize the visualized image to fit the button, maintaining aspect ratio
                 img_h, img_w = tmp_vis_for_button.shape[:2]
-                if img_h == 0 or img_w == 0: continue # Skip if image is invalid
+                if img_h == 0 or img_w == 0:
+                    continue  # Skip if image is invalid
 
                 aspect_ratio = img_w / img_h
                 
@@ -1743,11 +2223,12 @@ class MainWindow(QMainWindow):
                     target_h = button_height
                     target_w = int(target_h * aspect_ratio)
                 
-                if target_w <= 0 or target_h <= 0: continue # Skip if dimensions are invalid
+                if target_w <= 0 or target_h <= 0:
+                    continue  # Skip if dimensions are invalid
 
                 try:
                     resized_vis = cv2.resize(tmp_vis_for_button, (target_w, target_h), interpolation=cv2.INTER_AREA)
-                except cv2.error as e:
+                except cv2.error:
                     # print(f"cv2.resize error: {e} with target_w={target_w}, target_h={target_h}")
                     continue
 
@@ -1767,7 +2248,7 @@ class MainWindow(QMainWindow):
                 button_proposal.setShortcut(str(idx+1))
 
     def transform_input(self, image, box=None, points=None):
-        if self.keep_input_size == True:
+        if self.keep_input_size:
             return image, box, points
         else:
             h,w = image.shape[:2]
@@ -1780,7 +2261,7 @@ class MainWindow(QMainWindow):
             return image, box, points
     
     def transform_output(self, masks, size):
-        if self.keep_input_size == True:
+        if self.keep_input_size:
             return masks
         else:
             h,w = size
@@ -1790,9 +2271,33 @@ class MainWindow(QMainWindow):
                 new_masks[idx] = cv2.resize(masks[idx], (w,h))
             return new_masks
 
+    def _runPromptPrediction(
+        self,
+        image_np: np.ndarray,
+        image_key: ImageKey,
+        *,
+        point_coords: np.ndarray | None = None,
+        point_labels: np.ndarray | None = None,
+        box: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Run one prompt RPC and recover the GUI from fatal worker errors."""
+        if self.segmenter is None:
+            return None
+        try:
+            self.segmenter.set_image(image_np, image_key)
+            return self.segmenter.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                box=box,
+                multimask_output=True,
+            )
+        except MicroSamClientError as exc:
+            self._handleMicroSamClientError(exc)
+            return None
+
     def clickManualSegBBox(self):
         Box = self.canvas.currentBox
-        if self.segmenter is None or self.current_img == '' or Box == None:
+        if self.segmenter is None or self.current_img == '' or Box is None:
             return
         # Use .copy() to ensure the array is contiguous with positive strides
         img = cv2.imread(self.current_img)[:,:,::-1].copy()
@@ -1800,13 +2305,16 @@ class MainWindow(QMainWindow):
         input_box = np.array([Box[0].x(), Box[0].y(), Box[1].x(), Box[1].y()])
         img, input_box, _ = self.transform_input(img, box=input_box)
         image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
-        self.segmenter.set_image(img, image_key)
-        masks_sam_raw, iou_prediction, _ = self.segmenter.predict(
+        prediction = self._runPromptPrediction(
+            img,
+            image_key,
             point_coords=None,
             point_labels=None,
             box=input_box[None, :],
-            multimask_output=True,
         )
+        if prediction is None:
+            return
+        masks_sam_raw, iou_prediction, _ = prediction
         # self.masks = masks_sam_raw # Store raw SAM masks if needed for other purposes
 
         # Transform raw masks to original image dimensions
@@ -1875,19 +2383,19 @@ class MainWindow(QMainWindow):
     def clickManualSegBox(self):
         ClickPos = self.canvas.currentPos
         ClickNeg = self.canvas.currentNeg
-        if self.segmenter is None or self.current_img == '' or (ClickPos == None and ClickNeg == None):
+        if self.segmenter is None or self.current_img == '' or (ClickPos is None and ClickNeg is None):
             return
         img = cv2.imread(self.current_img)[:,:,::-1].copy()
         rh, rw = img.shape[:2]
 
         input_clicks = []
         input_types = []
-        if ClickPos != None:
+        if ClickPos is not None:
             for pos in ClickPos:
                 input_clicks.append([int(pos.x()), int(pos.y())])
                 input_types.append(1)
 
-        if ClickNeg != None:
+        if ClickNeg is not None:
             for neg in ClickNeg:
                 input_clicks.append([int(neg.x()), int(neg.y())])
                 input_types.append(0)
@@ -1901,12 +2409,15 @@ class MainWindow(QMainWindow):
         img, _, input_clicks = self.transform_input(img, points=input_clicks)
 
         image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
-        self.segmenter.set_image(img, image_key)
-        masks_sam_raw, iou_prediction, _ = self.segmenter.predict(
+        prediction = self._runPromptPrediction(
+            img,
+            image_key,
             point_coords=input_clicks,
             point_labels=input_types,
-            multimask_output=True,
         )
+        if prediction is None:
+            return
+        masks_sam_raw, iou_prediction, _ = prediction
         # self.masks = masks_sam_raw # Store raw SAM masks if needed for other purposes
 
         # Transform raw masks to original image dimensions
@@ -2019,7 +2530,7 @@ class MainWindow(QMainWindow):
                     label, _, group_id = xx
             if label is None:
                 label = 'Object'
-            if type(group_id) != int:
+            if not isinstance(group_id, int):
                 group_id=self.getMaxId() + 1
             
             # 各マスクにラベルとグループIDを設定してaddLabelで追加
@@ -2578,9 +3089,6 @@ class MainWindow(QMainWindow):
         # デバッグ情報
         print(f"Restoring primaries: {primary_ids} from secondary: {secondary_group_id}")
         
-        # primary_idsを文字列のリストに正規化
-        primary_ids_str = [str(pid) for pid in primary_ids]
-        
         # 復元されたシェイプを追跡
         restored = False
         
@@ -2615,12 +3123,12 @@ class MainWindow(QMainWindow):
                     # 見た目を更新
                     self._update_shape_color(shape)
                     restored = True
-                    print(f"Restored shape to original mask form")
+                    print("Restored shape to original mask form")
         
         # キャンバス全体を更新
         if restored:
             self.canvas.update()
-            print(f"Canvas updated - restoration complete")
+            print("Canvas updated - restoration complete")
 
     def duplicateSelectedShape(self):
         added_shapes = self.canvas.duplicateSelectedShapes()
@@ -2804,14 +3312,16 @@ class MainWindow(QMainWindow):
             img, input_box, _ = self.transform_input(img, box=input_box)
 
             image_key = build_image_key(self.current_img, self.keep_input_size, self.max_size)
-            self.segmenter.set_image(img, image_key)
-
-            masks, iou_prediction, _ = self.segmenter.predict(
+            prediction = self._runPromptPrediction(
+                img,
+                image_key,
                 point_coords=None,
                 point_labels=None,
                 box=input_box[None, :],
-                multimask_output=True,
             )
+            if prediction is None:
+                return
+            masks, iou_prediction, _ = prediction
             
             masks = self.transform_output(masks.astype(np.uint8), (rh,rw))
             target_idx = np.argmax(iou_prediction)
@@ -3046,7 +3556,7 @@ class MainWindow(QMainWindow):
                 
                 lmajor = max(width, height) * scale
                 lminor = min(width, height) * scale
-                l = (lmajor + lminor) / 2
+                mean_length = (lmajor + lminor) / 2
                 
                 # マスクから面積を計算
                 area = 0
@@ -3072,7 +3582,7 @@ class MainWindow(QMainWindow):
                     "label": segment.label,  # 元のラベルは別カラムに保持
                     "Lmajor [um]": round(lmajor, 3),
                     "Lminor [um]": round(lminor, 3),
-                    "L[um]": round(l, 1),
+                    "L[um]": round(mean_length, 1),
                     "Lmean[um]": "",
                     "n": "",
                     "Agg.": "",
@@ -3087,7 +3597,7 @@ class MainWindow(QMainWindow):
 
                 lmajor = max(width, height) * scale
                 lminor = min(width, height) * scale
-                l = (lmajor + lminor) / 2
+                mean_length = (lmajor + lminor) / 2
 
                 # マスクから面積を計算
                 area = 0
@@ -3113,7 +3623,7 @@ class MainWindow(QMainWindow):
                     "label": segment.label,  # 元のラベルは別カラムに保持
                     "Lmajor [um]": round(lmajor, 3),
                     "Lminor [um]": round(lminor, 3),
-                    "L[um]": round(l, 1),
+                    "L[um]": round(mean_length, 1),
                     "Lmean[um]": "",
                     "n": "",
                     "Agg.": "",
@@ -3393,9 +3903,6 @@ class MainWindow(QMainWindow):
             
             # 対角点のペアを計算（0-2と1-3が対角）
             if len(points) >= 4:  # OBBの場合のみ長軸・短軸を計算
-                diag1 = np.linalg.norm(points[0] - points[2])
-                diag2 = np.linalg.norm(points[1] - points[3])
-                
                 # 辺の長さを計算
                 edge1 = np.linalg.norm(points[0] - points[1])
                 edge2 = np.linalg.norm(points[1] - points[2])
@@ -3469,7 +3976,7 @@ class MainWindow(QMainWindow):
         # Optionally, if a mask proposal is already shown, you might want to re-filter and update it.
         # This depends on the desired UX. For now, new proposals will use the new threshold.
 
-    def filter_and_reconstruct_masks(self, masks_to_filter, area_threshold):
+    def filter_and_reconstruct_masks(self, masks_to_filter, area_threshold):  # noqa: F811
         if masks_to_filter is None or masks_to_filter.ndim != 3:
             return np.array([]) # Return empty if input is not as expected
 

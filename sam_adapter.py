@@ -5,13 +5,9 @@ device placement, embedding computation/caching, and mask prediction)
 behind a small ``SegmenterAdapter`` interface so that ``0_annotator_sam2.py``
 never talks to SAM2 (or, in the future, micro-sam) internals directly.
 
-Phase 1 scope:
-- ``Sam2Adapter``: a faithful port of the current SAM2 behavior, plus a
-  correctness-first embedding LRU cache and explicit GPU teardown on
-  ``unload()``.
-- ``MicroSamAdapter``: an interface-complete skeleton only. Real inference
-  is deferred to a later phase; micro-sam is never imported at module load
-  time.
+``Sam2Adapter`` runs in the main process. ``MicroSamAdapter`` delegates to a
+persistent subprocess in the isolated micro-sam environment, so micro-sam is
+never imported into the annotator process.
 
 Design notes (see task spec / Codex consultation for full rationale):
 - The embedding cache key is a 5-tuple: ``(image_hash, model_name,
@@ -38,10 +34,9 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import importlib
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -50,6 +45,13 @@ import torch
 
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+from micro_sam_client import (
+    MicroSamClientError,
+    MicroSamProtocolError,
+    MicroSamWorkerClient,
+    micro_sam_interpreter_exists,
+)
 
 if TYPE_CHECKING:
     from auto_annotation import AmgParams, AutoMask
@@ -99,14 +101,103 @@ SAM2_MODEL_SPECS.update(
     }
 )
 
-# Placeholder names for the future micro-sam integration (Phase 3). These are
-# used only to populate the (disabled) model-switch menu; no micro-sam
-# checkpoints or specs are wired up in Phase 1.
-MICRO_SAM_MODEL_NAMES: tuple[str, ...] = ("micro-sam",)
+MICRO_SAM_MODEL_NAMES: tuple[str, ...] = (
+    "vit_b_em_organelles",
+    "vit_l_em_organelles",
+    "vit_b",
+)
+
+
+@dataclass(frozen=True)
+class MicroSamModelSpec:
+    """Static automatic-mode capabilities for one micro-sam model."""
+
+    name: str
+    supported_auto_modes: tuple[str, ...]
+    default_auto_mode: str
+
+
+MICRO_SAM_MODEL_SPECS = {
+    "vit_b_em_organelles": MicroSamModelSpec(
+        "vit_b_em_organelles",
+        ("ais", "apg", "amg"),
+        "ais",
+    ),
+    "vit_l_em_organelles": MicroSamModelSpec(
+        "vit_l_em_organelles",
+        ("ais", "apg", "amg"),
+        "ais",
+    ),
+    "vit_b": MicroSamModelSpec("vit_b", ("amg",), "amg"),
+}
+MICRO_SAM_CHECKPOINT_SIZE_MB: dict[str, int] = {
+    "vit_b": 360,
+    "vit_b_em_organelles": 360,
+    "vit_l_em_organelles": 1200,
+}
+
+
+@dataclass(frozen=True)
+class MicroSamParams:
+    """Mode-discriminated automatic segmentation parameters for micro-sam."""
+
+    mode: str = "ais"
+    min_mask_region_area: int = 100
+    points_per_side: int = 32
+    pred_iou_thresh: float = 0.86
+    stability_score_thresh: float = 0.92
+    box_nms_thresh: float = 0.7
+    center_distance_threshold: float = 0.5
+    boundary_distance_threshold: float = 0.5
+    foreground_threshold: float = 0.5
+    foreground_smoothing: float = 1.0
+    distance_smoothing: float = 1.6
+    multimasking: bool = False
+    batch_size: int = 32
+    nms_threshold: float = 0.9
+
+    def to_worker_params(self) -> dict[str, object]:
+        """Return only fields accepted by the selected worker mode."""
+        common: dict[str, object] = {
+            "mode": self.mode,
+            "min_mask_region_area": self.min_mask_region_area,
+        }
+        if self.mode == "amg":
+            return {
+                **common,
+                "points_per_side": self.points_per_side,
+                "pred_iou_thresh": self.pred_iou_thresh,
+                "stability_score_thresh": self.stability_score_thresh,
+                "box_nms_thresh": self.box_nms_thresh,
+            }
+        if self.mode == "ais":
+            return {
+                **common,
+                "center_distance_threshold": self.center_distance_threshold,
+                "boundary_distance_threshold": self.boundary_distance_threshold,
+                "foreground_threshold": self.foreground_threshold,
+                "foreground_smoothing": self.foreground_smoothing,
+                "distance_smoothing": self.distance_smoothing,
+            }
+        if self.mode == "apg":
+            return {
+                **common,
+                "center_distance_threshold": self.center_distance_threshold,
+                "boundary_distance_threshold": self.boundary_distance_threshold,
+                "foreground_threshold": self.foreground_threshold,
+                "multimasking": self.multimasking,
+                "batch_size": self.batch_size,
+                "nms_threshold": self.nms_threshold,
+            }
+        raise ValueError(f"Unsupported micro-sam mode: {self.mode}")
 
 
 class NotInstalledError(RuntimeError):
     """Raised when an optional segmenter backend dependency is unavailable."""
+
+
+class MicroSamDownloadCancelledError(RuntimeError):
+    """Raised when the user declines a first-time checkpoint download."""
 
 
 def hash_file_bytes(path: str) -> str:
@@ -195,7 +286,11 @@ class SegmenterAdapter(ABC):
 
     @abstractmethod
     def load(self) -> None:
-        """Load the model weights and initialize the underlying predictor."""
+        """Load model weights and initialize the predictor.
+
+        ``MicroSamAdapter`` additionally accepts a backend-specific
+        ``confirm_download`` callback for first-time checkpoint downloads.
+        """
 
     @abstractmethod
     def set_image(self, image_np: np.ndarray, image_key: ImageKey) -> None:
@@ -226,7 +321,7 @@ class SegmenterAdapter(ABC):
         image_np: np.ndarray,
         image_key: ImageKey,
         *,
-        params: "AmgParams | None" = None,
+        params: "AmgParams | MicroSamParams | None" = None,
     ) -> AutoSegmentationResult:
         """Generate automatic masks when the backend supports AMG.
 
@@ -291,6 +386,7 @@ class Sam2Adapter(SegmenterAdapter):
         sam = build_sam2(
             config_file=self._model_spec.config_file,
             ckpt_path=self._model_spec.checkpoint_path,
+            device=self._device,
         )
         sam.to(device=self._device)
         self._sam = sam
@@ -333,7 +429,7 @@ class Sam2Adapter(SegmenterAdapter):
         image_np: np.ndarray,
         image_key: ImageKey,
         *,
-        params: "AmgParams | None" = None,
+        params: "AmgParams | MicroSamParams | None" = None,
     ) -> AutoSegmentationResult:
         """Run SAM2 AMG with the already-loaded model instance.
 
@@ -348,6 +444,8 @@ class Sam2Adapter(SegmenterAdapter):
 
         from auto_annotation import AmgParams, Sam2AmgAutoAnnotator
 
+        if isinstance(params, MicroSamParams):
+            raise TypeError("Sam2Adapter requires AmgParams, not MicroSamParams")
         resolved_params = params or AmgParams()
         annotator = Sam2AmgAutoAnnotator.from_model(
             self._sam,
@@ -431,17 +529,18 @@ class Sam2Adapter(SegmenterAdapter):
 
 
 class MicroSamAdapter(SegmenterAdapter):
-    """Interface-complete skeleton for a future micro-sam backend.
+    """Segmenter adapter backed by a persistent isolated micro-sam worker."""
 
-    Phase 1 does not implement real inference and does not import
-    micro-sam at module load time. ``load()`` performs a lazy import and
-    raises a clear, Japanese-friendly error explaining that micro-sam must
-    be installed in an isolated environment (Phase 3).
-    """
-
-    def __init__(self, model_name: str = "micro-sam") -> None:
+    def __init__(self, model_name: str, *, device: str = "auto") -> None:
+        if model_name not in MICRO_SAM_MODEL_SPECS:
+            raise ValueError(f"Unsupported micro-sam model: {model_name}")
         self._model_name = model_name
+        self._device = device
         self._checkpoint_hash: str | None = None
+        self._client: MicroSamWorkerClient | None = None
+        self._supported_auto_modes = MICRO_SAM_MODEL_SPECS[
+            model_name
+        ].supported_auto_modes
 
     @property
     def name(self) -> str:
@@ -451,23 +550,82 @@ class MicroSamAdapter(SegmenterAdapter):
     def checkpoint_hash(self) -> str | None:
         return self._checkpoint_hash
 
-    def load(self) -> None:
-        try:
-            importlib.import_module("micro_sam")
-        except ImportError as exc:
+    @property
+    def supported_auto_modes(self) -> tuple[str, ...]:
+        """Return automatic modes supported by the loaded model."""
+        return self._supported_auto_modes
+
+    @property
+    def default_auto_mode(self) -> str:
+        """Return the model's default automatic mode."""
+        return MICRO_SAM_MODEL_SPECS[self.name].default_auto_mode
+
+    def load(
+        self,
+        *,
+        confirm_download: Callable[[str], bool] | None = None,
+        client: MicroSamWorkerClient | None = None,
+    ) -> None:
+        if not micro_sam_interpreter_exists():
             raise NotInstalledError(
                 "micro-sam がインストールされていません。"
-                "micro-sam は別環境へのインストールが必要です"
-                "(Phase 3 で対応予定)。SAM2 モデルを選択してください。"
-            ) from exc
-        raise NotImplementedError(
-            "micro-sam アダプタの推論処理は Phase 3 で実装予定です。"
-        )
+                "分離環境 envs/micro_sam が必要です。"
+                "SAM2 モデルを選択してください。"
+            )
+        if self._client is not None:
+            return
+        if client is None:
+            client = MicroSamWorkerClient()
+        try:
+            probe_metadata = client.probe(self.name)
+            cached = probe_metadata.get("cached")
+            if (
+                probe_metadata.get("model_type") != self.name
+                or not isinstance(cached, bool)
+            ):
+                raise MicroSamProtocolError(
+                    "probe",
+                    "invalid_result",
+                    "worker cache metadata did not match the requested model",
+                    stderr_tail=client.stderr_tail,
+                    fatal=True,
+                )
+            if not cached and confirm_download is not None:
+                proceed = confirm_download(self.name)
+                if not proceed:
+                    client.terminate()
+                    raise MicroSamDownloadCancelledError(
+                        f"{self.name} のダウンロードがキャンセルされました"
+                    )
+            metadata = client.init(self.name, self._device, cached=cached)
+            checkpoint_hash = metadata.get("checkpoint_hash")
+            supported_modes = metadata.get("supported_auto_modes")
+            if (
+                metadata.get("model_type") != self.name
+                or not isinstance(checkpoint_hash, str)
+                or len(checkpoint_hash) != 64
+                or any(character not in "0123456789abcdef" for character in checkpoint_hash)
+                or supported_modes != list(self._supported_auto_modes)
+            ):
+                raise MicroSamProtocolError(
+                    "init",
+                    "invalid_result",
+                    "worker metadata did not match the requested model",
+                    stderr_tail=client.stderr_tail,
+                    fatal=True,
+                )
+        except Exception:
+            client.terminate()
+            raise
+        self._client = client
+        self._checkpoint_hash = checkpoint_hash
 
     def set_image(self, image_np: np.ndarray, image_key: ImageKey) -> None:
-        raise NotImplementedError(
-            "micro-sam アダプタの推論処理は Phase 3 で実装予定です。"
-        )
+        client = self._require_client()
+        try:
+            client.set_image(image_np, image_key)
+        except MicroSamClientError as exc:
+            self._handle_client_error(exc)
 
     def predict(
         self,
@@ -477,9 +635,138 @@ class MicroSamAdapter(SegmenterAdapter):
         box: np.ndarray | None = None,
         multimask_output: bool = True,
     ) -> PredictionResult:
-        raise NotImplementedError(
-            "micro-sam アダプタの推論処理は Phase 3 で実装予定です。"
-        )
+        client = self._require_client()
+        flattened_box = box
+        if box is not None:
+            box_array = np.asarray(box)
+            if box_array.shape == (1, 4):
+                flattened_box = box_array[0]
+            elif box_array.shape != (4,):
+                raise ValueError("micro-sam box must have shape (4,) or (1, 4)")
+        try:
+            return client.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                box=flattened_box,
+                multimask_output=multimask_output,
+            )
+        except MicroSamClientError as exc:
+            self._handle_client_error(exc)
+
+    def generate_auto(
+        self,
+        image_np: np.ndarray,
+        image_key: ImageKey,
+        *,
+        params: "AmgParams | MicroSamParams | None" = None,
+    ) -> AutoSegmentationResult:
+        """Generate polygon-only automatic masks through the worker."""
+        if params is not None and not isinstance(params, MicroSamParams):
+            raise TypeError("MicroSamAdapter requires MicroSamParams")
+        resolved_params = params or MicroSamParams(mode=self.default_auto_mode)
+        if resolved_params.mode not in self._supported_auto_modes:
+            raise ValueError(
+                f"{self.name} does not support micro-sam mode {resolved_params.mode}"
+            )
+        client = self._require_client()
+        try:
+            result = client.generate_auto(
+                image_np,
+                image_key,
+                resolved_params.to_worker_params(),
+            )
+            return self._decode_auto_masks(result, client)
+        except MicroSamClientError as exc:
+            self._handle_client_error(exc)
 
     def unload(self) -> None:
-        return None
+        client = self._client
+        self._client = None
+        self._checkpoint_hash = None
+        if client is None:
+            return
+        try:
+            client.unload()
+            client.shutdown()
+        except MicroSamClientError:
+            client.terminate()
+
+    def _require_client(self) -> MicroSamWorkerClient:
+        if self._client is None or not self._client.is_alive:
+            self._client = None
+            self._checkpoint_hash = None
+            raise RuntimeError(
+                f"micro-sam worker ({self.name}) is not loaded; call load() first."
+            )
+        return self._client
+
+    def _handle_client_error(self, error: MicroSamClientError) -> None:
+        if error.fatal:
+            client = self._client
+            self._client = None
+            self._checkpoint_hash = None
+            if client is not None:
+                client.terminate()
+        raise error
+
+    @staticmethod
+    def _decode_auto_masks(
+        result: dict[str, object],
+        client: MicroSamWorkerClient,
+    ) -> AutoSegmentationResult:
+        from auto_annotation.base import AutoMask
+
+        if set(result) != {"mode", "image_shape", "masks"}:
+            client.terminate()
+            raise MicroSamProtocolError(
+                "generate_auto",
+                "invalid_result",
+                "worker automatic result has an invalid schema",
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            )
+        records = result.get("masks")
+        if not isinstance(records, list):
+            client.terminate()
+            raise MicroSamProtocolError(
+                "generate_auto",
+                "invalid_result",
+                "worker masks result must be a list",
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            )
+        auto_masks: list[AutoMask] = []
+        try:
+            for record in records:
+                if not isinstance(record, dict) or set(record) != {
+                    "points",
+                    "score",
+                    "area",
+                }:
+                    raise ValueError("invalid automatic mask record")
+                points_value = record["points"]
+                if not isinstance(points_value, list):
+                    raise ValueError("automatic mask points must be a list")
+                points = [[float(x), float(y)] for x, y in points_value]
+                score_value = record["score"]
+                area_value = record["area"]
+                auto_masks.append(
+                    AutoMask(
+                        segmentation=None,
+                        score=(
+                            float(score_value) if score_value is not None else None
+                        ),
+                        area=int(area_value),
+                        points=points,
+                    )
+                )
+        except (TypeError, ValueError) as exc:
+            client.terminate()
+            raise MicroSamProtocolError(
+                "generate_auto",
+                "invalid_result",
+                str(exc),
+                stderr_tail=client.stderr_tail,
+                fatal=True,
+            ) from exc
+        return auto_masks
