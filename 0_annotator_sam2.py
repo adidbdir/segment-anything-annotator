@@ -63,6 +63,7 @@ from sam_adapter import (  # noqa: E402
     MICRO_SAM_CHECKPOINT_SIZE_MB,
     MICRO_SAM_MODEL_NAMES,
     MICRO_SAM_MODEL_SPECS,
+    SAM2_LORA_MODEL_SPECS,
     SAM2_MODEL_SPECS,
     CellposeAdapter,
     CellposeParams,
@@ -74,6 +75,7 @@ from sam_adapter import (  # noqa: E402
     MicroSamParams,
     NotInstalledError,
     Sam2Adapter,
+    Sam2LoraAdapter,
     SegmenterAdapter,
     build_image_key,
     cellpose_interpreter_exists,
@@ -1671,9 +1673,10 @@ class MainWindow(QMainWindow):
         mutually exclusive entries that trigger clickLoadSAM(model_name) on
         selection (this both performs the initial load and runtime
         switches). micro-sam entries are available only when the isolated
-        interpreter exists under ``envs/micro_sam``. MatSAM entries require
-        both their isolated interpreter and their model-specific checkpoint.
-        Cellpose entries require only their isolated interpreter.
+        interpreter exists under ``envs/micro_sam``. SAM2 LoRA entries require
+        their model-specific checkpoint. MatSAM entries require both their
+        isolated interpreter and their model-specific checkpoint. Cellpose
+        entries require only their isolated interpreter.
         """
         self.samModelMenu = QtWidgets.QMenu(self.tr("SAM Model"), self)
         self.samModelActionGroup = QtWidgets.QActionGroup(self)
@@ -1686,6 +1689,29 @@ class MainWindow(QMainWindow):
             self.samModelActionGroup.addAction(act)
             self.samModelMenu.addAction(act)
             self.samModelActions[name] = act
+
+        samLoraMenu = self.samModelMenu.addMenu(self.tr("SAM2 (LoRA)"))
+        for name, model_spec in SAM2_LORA_MODEL_SPECS.items():
+            checkpoint_path = model_spec.lora_checkpoint_path
+            if not os.path.isabs(checkpoint_path):
+                checkpoint_path = os.path.join(project_root, checkpoint_path)
+            checkpoint_available = os.path.isfile(checkpoint_path)
+            label = name if checkpoint_available else f"{name} (未導入)"
+            lora_act = QtWidgets.QAction(self.tr(label), self, checkable=True)
+            lora_act.setChecked(name == self.sam_model)
+            lora_act.setEnabled(checkpoint_available)
+            if checkpoint_available:
+                lora_act.triggered.connect(functools.partial(self.clickLoadSAM, name))
+            else:
+                lora_tip = self.tr(
+                    f"未導入: SAM2 LoRAチェックポイントが見つかりません: "
+                    f"{checkpoint_path}"
+                )
+                lora_act.setToolTip(lora_tip)
+                lora_act.setStatusTip(lora_tip)
+            self.samModelActionGroup.addAction(lora_act)
+            samLoraMenu.addAction(lora_act)
+            self.samModelActions[name] = lora_act
 
         microSamMenu = self.samModelMenu.addMenu(self.tr("micro-sam"))
         micro_sam_tip = self.tr(
@@ -1777,6 +1803,7 @@ class MainWindow(QMainWindow):
         target_model = model_name or getattr(self, "sam_model", "large")
         all_model_names = (
             set(SAM2_MODEL_SPECS)
+            | set(SAM2_LORA_MODEL_SPECS)
             | set(MICRO_SAM_MODEL_NAMES)
             | set(MATSAM_MODEL_NAMES)
             | set(CELLPOSE_MODEL_NAMES)
@@ -1789,6 +1816,7 @@ class MainWindow(QMainWindow):
             return  # already the active model; nothing to do
 
         old_segmenter = self.segmenter
+        is_lora_target = target_model in SAM2_LORA_MODEL_SPECS
         is_micro_sam_target = target_model in MICRO_SAM_MODEL_SPECS
         is_matsam_target = target_model in MATSAM_MODEL_SPECS
         is_cellpose_target = target_model in CELLPOSE_MODEL_NAMES
@@ -1880,6 +1908,31 @@ class MainWindow(QMainWindow):
                 )
                 self._restoreSamLoadUi()
                 return
+        elif is_lora_target:
+            model_spec = SAM2_LORA_MODEL_SPECS[target_model]
+            print(
+                f"SAM2 LoRAモデルを読み込みます: {target_model} "
+                f"({model_spec.lora_checkpoint_path})"
+            )
+            try:
+                checkpoint_path = model_spec.lora_checkpoint_path
+                if not os.path.isabs(checkpoint_path):
+                    checkpoint_path = os.path.join(project_root, checkpoint_path)
+                if not os.path.isfile(checkpoint_path):
+                    raise NotInstalledError(
+                        f"SAM2 LoRAチェックポイントが見つかりません: "
+                        f"{checkpoint_path}。"
+                        "チェックポイントを配置するか、別のSAMモデルを選択してください。"
+                    )
+            except (NotInstalledError, NotImplementedError) as e:
+                QMessageBox.warning(self, "警告", str(e))
+                self._restoreSamLoadUi()
+                return
+            new_segmenter = Sam2LoraAdapter(model_spec)
+            old_segmenter_to_unload = old_segmenter
+            # SAM2 must release the old model before loading the new one to
+            # avoid temporarily holding two models in GPU memory.
+            self.segmenter = None
         else:
             print(
                 f"SAM2モデルを読み込みます: {target_model} "
@@ -4801,6 +4854,7 @@ def get_parser():
         default="large",
         choices=[
             *SAM2_MODEL_SPECS,
+            *SAM2_LORA_MODEL_SPECS,
             *MICRO_SAM_MODEL_NAMES,
             *MATSAM_MODEL_NAMES,
             *CELLPOSE_MODEL_NAMES,

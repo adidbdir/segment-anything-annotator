@@ -53,6 +53,11 @@ from cellpose_client import (
     CellposeWorkerClient,
     cellpose_interpreter_exists,
 )
+from lora_sam2 import (
+    DEFAULT_LORA_TARGET_MODULES,
+    apply_lora_to_sam2,
+    load_lora_weights,
+)
 from matsam_client import (
     MatSamClientError,
     MatSamProtocolError,
@@ -122,6 +127,29 @@ SAM2_MODEL_SPECS.update(
         ),
     }
 )
+
+
+@dataclass(frozen=True)
+class Sam2LoraModelSpec:
+    """Identity of one trained LoRA checkpoint layered on a SAM2 base model."""
+
+    name: str
+    base_model_name: str
+    lora_checkpoint_path: str
+    rank: int
+    alpha: float
+    target_modules: tuple[str, ...] = DEFAULT_LORA_TARGET_MODULES
+
+
+SAM2_LORA_MODEL_SPECS: dict[str, Sam2LoraModelSpec] = {
+    "sam2-lora:tiny-crystal-r64": Sam2LoraModelSpec(
+        name="sam2-lora:tiny-crystal-r64",
+        base_model_name="tiny",
+        lora_checkpoint_path="models/lora/sam2_tiny_crystal_lora_r64.pth",
+        rank=64,
+        alpha=1.0,
+    ),
+}
 
 MICRO_SAM_MODEL_NAMES: tuple[str, ...] = (
     "vit_b_em_organelles",
@@ -657,6 +685,75 @@ class Sam2Adapter(SegmenterAdapter):
         predictor._orig_hw = list(entry.orig_hw)
         predictor._is_image_set = True
         predictor._is_batch = False
+
+
+class Sam2LoraAdapter(Sam2Adapter):
+    """SAM2 adapter with a validated LoRA checkpoint applied at load time."""
+
+    def __init__(
+        self,
+        model_spec: Sam2LoraModelSpec,
+        *,
+        device: str | None = None,
+        cache_maxsize: int = DEFAULT_EMBEDDING_CACHE_SIZE,
+    ) -> None:
+        self._lora_spec = model_spec
+        self._base_spec = SAM2_MODEL_SPECS[model_spec.base_model_name]
+        super().__init__(
+            self._base_spec,
+            device=device,
+            cache_maxsize=cache_maxsize,
+        )
+
+    @property
+    def name(self) -> str:
+        return self._lora_spec.name
+
+    def load(self) -> None:
+        lora_checkpoint_path = self._resolve_lora_checkpoint_path()
+        if not lora_checkpoint_path.is_file():
+            raise NotInstalledError(
+                f"SAM2 LoRAチェックポイントが見つかりません: "
+                f"{lora_checkpoint_path}。"
+                "チェックポイントを配置するか、別のSAMモデルを選択してください。"
+            )
+
+        base_checkpoint_hash = hash_file_bytes(self._base_spec.checkpoint_path)
+        lora_checkpoint_hash = hash_file_bytes(str(lora_checkpoint_path))
+        # Hash both files so cross-checkpoint embedding reuse is structurally
+        # impossible even if model names are ever configured incorrectly.
+        checkpoint_hash = hashlib.blake2b(
+            (base_checkpoint_hash + lora_checkpoint_hash).encode(),
+            digest_size=HASH_DIGEST_SIZE,
+        ).hexdigest()
+
+        sam = build_sam2(
+            config_file=self._base_spec.config_file,
+            ckpt_path=self._base_spec.checkpoint_path,
+            device=self._device,
+        )
+        sam.to(device=self._device)
+        apply_lora_to_sam2(
+            sam,
+            rank=self._lora_spec.rank,
+            alpha=self._lora_spec.alpha,
+            target_modules=self._lora_spec.target_modules,
+        )
+        load_lora_weights(
+            sam,
+            lora_checkpoint_path,
+            device=self._device,
+            strict_config=True,
+        )
+        self._checkpoint_hash = checkpoint_hash
+        self._sam = sam
+        self._predictor = SAM2ImagePredictor(sam)
+
+    def _resolve_lora_checkpoint_path(self) -> Path:
+        checkpoint_path = Path(self._lora_spec.lora_checkpoint_path)
+        if checkpoint_path.is_absolute():
+            return checkpoint_path
+        return (REPO_ROOT / checkpoint_path).resolve()
 
 
 class MicroSamAdapter(SegmenterAdapter):
