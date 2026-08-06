@@ -227,6 +227,9 @@ class MatSamParams:
     box_nms_thresh: float = 0.80
     min_mask_region_area: int = 0
     max_image_size: int = 1024
+    # This is SAM's automatic mask generator's dominant peak-VRAM driver;
+    # lower values such as 32-64 trade inference speed for substantially less VRAM.
+    points_per_batch: int = 256
 
     def to_worker_params(self) -> dict[str, object]:
         """Return the exact parameter schema accepted by the MatSAM worker."""
@@ -240,6 +243,7 @@ class MatSamParams:
             "box_nms_thresh": self.box_nms_thresh,
             "min_mask_region_area": self.min_mask_region_area,
             "max_image_size": self.max_image_size,
+            "points_per_batch": self.points_per_batch,
         }
 
 

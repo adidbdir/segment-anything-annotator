@@ -84,6 +84,7 @@ class MatSamRemoteError(MatSamClientError):
         *,
         stderr_tail: str,
         fatal: bool,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             command,
@@ -94,6 +95,7 @@ class MatSamRemoteError(MatSamClientError):
         )
         self.code = code
         self.error_type = error_type
+        self.details: dict[str, Any] = {} if details is None else dict(details)
 
 
 @dataclass
@@ -148,6 +150,8 @@ class MatSamWorkerClient:
                 "VIRTUAL_ENV": str(MATSAM_ENV),
                 "PYTHONUNBUFFERED": "1",
                 "PYTHONNOUSERSITE": "1",
+                "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             }
         )
         self._process = subprocess.Popen(
@@ -436,11 +440,17 @@ class MatSamWorkerClient:
             "type",
             "message",
             "fatal",
+            "details",
         }:
             self._raise_fatal(command, "invalid_response", "error payload is invalid")
         fatal = error["fatal"]
-        if not isinstance(fatal, bool) or not all(
-            isinstance(error[field], str) for field in ("code", "type", "message")
+        if (
+            not isinstance(fatal, bool)
+            or not isinstance(error["details"], dict)
+            or not all(
+                isinstance(error[field], str)
+                for field in ("code", "type", "message")
+            )
         ):
             self._raise_fatal(
                 command, "invalid_response", "error payload types are invalid"
@@ -452,6 +462,7 @@ class MatSamWorkerClient:
             error["message"],
             stderr_tail=self.stderr_tail,
             fatal=fatal,
+            details=error["details"],
         )
         if fatal:
             self._terminate_process()

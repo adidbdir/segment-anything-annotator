@@ -81,7 +81,11 @@ from sam_adapter import (  # noqa: E402
     micro_sam_interpreter_exists,
 )
 from cellpose_client import CellposeClientError, CellposeWorkerClient  # noqa: E402
-from matsam_client import MatSamClientError, MatSamWorkerClient  # noqa: E402
+from matsam_client import (  # noqa: E402
+    MatSamClientError,
+    MatSamRemoteError,
+    MatSamWorkerClient,
+)
 from micro_sam_client import MicroSamClientError, MicroSamWorkerClient  # noqa: E402
 import csv_exporter  # noqa: E402
 
@@ -111,6 +115,9 @@ AUTO_SEG_MAX_SCALES = 10
 AUTO_SEG_MAX_IMAGE_SIZE = 32768
 MATSAM_METHOD_TYPE_MIN = 1
 MATSAM_METHOD_TYPE_MAX = 2
+MATSAM_MIN_POINTS_PER_BATCH = 1
+MATSAM_MAX_POINTS_PER_BATCH = 256
+MATSAM_MB_PER_GB = 1024.0
 CELLPOSE_DIAMETER_MIN = 0.0
 CELLPOSE_DIAMETER_MAX = 10000.0
 CELLPOSE_DEFAULT_MANUAL_DIAMETER = 30.0
@@ -2122,6 +2129,45 @@ class MainWindow(QMainWindow):
 
     def _handleMatSamClientError(self, error: MatSamClientError) -> None:
         """Reset GUI backend state after a MatSAM client failure."""
+        if isinstance(error, MatSamRemoteError) and error.code == "insufficient_vram":
+            variant_value = error.details.get("sam_variant")
+            fallback_variant = getattr(self.segmenter, "name", None)
+            variant = (
+                variant_value
+                if isinstance(variant_value, str) and variant_value
+                else (
+                    fallback_variant
+                    if isinstance(fallback_variant, str) and fallback_variant
+                    else "不明"
+                )
+            )
+            required_mb = error.details.get("required_mb")
+            free_mb = error.details.get("free_mb")
+            required_gb = (
+                f"{required_mb / MATSAM_MB_PER_GB:.1f}"
+                if isinstance(required_mb, (int, float))
+                and not isinstance(required_mb, bool)
+                else "不明"
+            )
+            free_gb = (
+                f"{free_mb / MATSAM_MB_PER_GB:.1f}"
+                if isinstance(free_mb, (int, float))
+                and not isinstance(free_mb, bool)
+                else "不明"
+            )
+            QMessageBox.warning(
+                self,
+                "警告",
+                (
+                    f"GPUメモリが不足しています(MatSAM {variant} には約{required_gb}GB必要、"
+                    f"現在の空きは約{free_gb}GB)。\n"
+                    "・他のGPU使用アプリ(ComfyUI, Blender など)を終了する\n"
+                    "・画像サイズ(max_image_size)を小さくする\n"
+                    "・より軽量な Cellpose(約1.8GB)や SAM2 を使う\n"
+                    "のいずれかをお試しください。"
+                ),
+            )
+            return
         if error.fatal:
             old_segmenter = self.segmenter
             self.segmenter = None
@@ -2436,6 +2482,14 @@ class MainWindow(QMainWindow):
         n_per_side_base.setValue(defaults.n_per_side_base)
         form_layout.addRow("基本の一辺あたりの点数", n_per_side_base)
 
+        points_per_batch = QtWidgets.QSpinBox(dialog)
+        points_per_batch.setRange(
+            MATSAM_MIN_POINTS_PER_BATCH,
+            MATSAM_MAX_POINTS_PER_BATCH,
+        )
+        points_per_batch.setValue(defaults.points_per_batch)
+        form_layout.addRow("バッチあたりの点数", points_per_batch)
+
         method_type = QtWidgets.QSpinBox(dialog)
         method_type.setRange(MATSAM_METHOD_TYPE_MIN, MATSAM_METHOD_TYPE_MAX)
         method_type.setValue(defaults.method_type)
@@ -2498,6 +2552,7 @@ class MainWindow(QMainWindow):
             box_nms_thresh=box_nms_thresh.value(),
             min_mask_region_area=min_mask_region_area.value(),
             max_image_size=max_image_size.value(),
+            points_per_batch=points_per_batch.value(),
         )
 
     def _showCellposeAutoSegParamsDialog(self) -> CellposeParams | None:
